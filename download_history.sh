@@ -10,6 +10,10 @@ PROXY_FILE="$DATA_DIR/proxies.txt"
 CONFIG_FILE="$DATA_DIR/config"
 USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 
+# # Примеры использования локального прокси для получения списков прокси, если дуступ на cdn.jsdelivr.net закрыт
+# MY_PROXY="http://1.2.3.4:3128"
+# MY_PROXY="socks5://1.2.3.4:1080"
+
 [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
 
 # Функция для логирования
