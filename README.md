@@ -1,20 +1,20 @@
 # Bitget History Downloader
 
-A Bash script to download and process historical market data (trades and depth) from Bitget's public API for cryptocurrency pairs like BTCUSDT. The script mirrors data locally, converts it to CSV, and imports it into an SQLite database with deduplication.
+A Bash script for downloading and processing historical market data (trades and depth) from Bitget's public API for cryptocurrency pairs like BTCUSDT. It mirrors data locally, converts it to CSV, and stores it in an SQLite database with deduplication.
 
 ## Features
 
-- **Data Types**: Supports `trades` (trade history) and `depth` (order book snapshots).
-- **Markets**: Handles both spot and futures markets.
-- **Local Mirroring**: Stores `.zip` files in `data/offline/` to avoid redundant downloads.
-- **Efficient Processing**: Converts `.xlsx` (depth) to `.csv`, skips existing files, and uses temporary folders for extraction.
-- **Deduplication**: Imports data into SQLite with checks to prevent duplicate entries (`trade_id` for trades, `timestamp` for depth).
-- **Proxy Support**: Uses SOCKS4/SOCKS5 proxies with fallback to a default proxy.
+- Supports `trades` (trade history) and `depth` (order book snapshots) for spot and futures markets.
+- Mirrors `.zip` files in `data/offline/` to skip redundant downloads.
+- Converts `.xlsx` (depth) to `.csv` and stores them in `data/csv/`.
+- Imports data into SQLite with deduplication (`trade_id` for trades, `timestamp` for depth).
+- Uses SOCKS4/SOCKS5 proxies with a configurable fallback proxy.
+- Configurable via `data/config` for sensitive settings like proxies.
 
 ## Prerequisites
 
-- **Linux/Unix** environment (e.g., Ubuntu, macOS).
-- **Dependencies**:
+- Linux/Unix environment (e.g., Ubuntu, macOS).
+- Dependencies:
   - `curl`: For downloading files.
   - `unzip`: For extracting `.zip` files.
   - `sqlite3`: For database operations.
@@ -23,6 +23,23 @@ A Bash script to download and process historical market data (trades and depth) 
   ```bash
   sudo apt-get install curl unzip sqlite3 gnumeric
   ```
+
+## Configuration
+
+Sensitive settings like the proxy can be defined in `data/config` (not included in the repository for security). Create it manually if needed.
+
+Example `data/config`:
+```bash
+MY_PROXY="socks5://1.2.3.4:1080"
+```
+
+If access to `cdn.jsdelivr.net` (used for proxy lists) is restricted, specify a local proxy in `data/config`. Examples:
+```bash
+# HTTP proxy
+MY_PROXY="http://1.2.3.4:3128"
+# SOCKS5 proxy
+MY_PROXY="socks5://1.2.3.4:1080"
+```
 
 ## Installation
 
@@ -39,7 +56,7 @@ A Bash script to download and process historical market data (trades and depth) 
 
 ## Usage
 
-Run the script with parameters to specify the trading pair, data type, market, and date range:
+Run the script with parameters for pair, data type, market, and date range:
 
 ```bash
 ./download_history.sh --pair BTCUSDT --type depth --market spot --start-date 2024-05-01 --end-date 2024-05-02
@@ -68,7 +85,6 @@ Download depth data for BTCUSDT (spot) from May 1 to May 2, 2024:
 ```
 
 Check the database:
-
 ```bash
 sqlite3 data/history_BTCUSDT_spot.db "SELECT COUNT(*) FROM depth;"
 ```
@@ -76,8 +92,8 @@ sqlite3 data/history_BTCUSDT_spot.db "SELECT COUNT(*) FROM depth;"
 ## Database Schema
 
 - **trades** table:
-  - `trade_id` (TEXT, PRIMARY KEY): Unique trade identifier.
-  - `timestamp` (INTEGER): Unix timestamp in milliseconds.
+  - `trade_id` (TEXT, PRIMARY KEY): Unique trade ID.
+  - `timestamp` (INTEGER): Unix timestamp (ms).
   - `price` (REAL): Trade price.
   - `side` (TEXT): Buy or sell.
   - `volume_quote` (REAL): Volume in quote currency.
@@ -85,7 +101,7 @@ sqlite3 data/history_BTCUSDT_spot.db "SELECT COUNT(*) FROM depth;"
   - Index: `idx_trades_timestamp` on `timestamp`.
 
 - **depth** table:
-  - `timestamp` (INTEGER, PRIMARY KEY): Unix timestamp in milliseconds.
+  - `timestamp` (INTEGER, PRIMARY KEY): Unix timestamp (ms).
   - `ask_price` (REAL): Best ask price.
   - `bid_price` (REAL): Best bid price.
   - `ask_volume` (REAL): Ask volume.
@@ -94,19 +110,19 @@ sqlite3 data/history_BTCUSDT_spot.db "SELECT COUNT(*) FROM depth;"
 
 ## Notes
 
-- The script checks for existing `.zip` and `.csv` files to avoid redundant downloads and conversions.
-- For `depth`, files are identical for spot (`1`) and futures (`2`), so the script reuses them if available.
+- Skips existing `.zip` and `.csv` files to avoid redundant downloads/conversions.
+- Depth files are identical for spot (`1`) and futures (`2`), reused if available.
 - Temporary files are stored in `/tmp/` and cleaned up after processing.
-- Proxies are sourced from a public list with a fallback to a default proxy (`socks5://178.217.101.5:1080`).
+- All data files (`data/`) are excluded from the repository via `.gitignore`.
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+Licensed under the MIT License. See [LICENSE](LICENSE) for details.
 
 ## Contributing
 
-Feel free to open issues or submit pull requests on GitHub.
+Open issues or submit pull requests on GitHub.
 
 ## Author
 
-- Maxim Gajdaj <maxim.gajdaj@gmail.com>
+Maxim Gajdaj <maxim.gajdaj@gmail.com>
