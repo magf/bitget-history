@@ -24,7 +24,7 @@ download_proxy_list() {
     for proto in 4 5; do
         local url="https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks$proto/data.txt"
         log "Скачиваем $url..."
-        if curl -x "$MY_PROXY" -s -o - "$url" >> "$PROXY_FILE"; then
+        if curl ${MY_PROXY:+-x $MY_PROXY }-s -o - "$url" >> "$PROXY_FILE"; then
             log "Успешно скачан $url"
             echo '' >> "$PROXY_FILE"
         else
