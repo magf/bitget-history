@@ -16,105 +16,91 @@ import (
 
 	"github.com/magf/bitget-history/internal/proxymanager"
 	"golang.org/x/net/proxy"
+
+	_ "github.com/bdandy/go-socks4" // Поддержка SOCKS4
 )
 
-// Downloader управляет загрузкой файлов через прокси.
+// Downloader управляет загрузкой файлов.
 type Downloader struct {
 	baseURL    string
 	userAgent  string
-	proxies    []string
 	outputDir  string
+	proxyMgr   *proxymanager.ProxyManager
 	maxRetries int
 }
 
-// NewDownloader создаёт новый менеджер загрузки.
-func NewDownloader(baseURL, userAgent, outputDir string, pm *proxymanager.ProxyManager) (*Downloader, error) {
-	proxies, err := pm.GetProxies()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get proxies: %w", err)
-	}
-	if len(proxies) == 0 {
-		return nil, fmt.Errorf("no working proxies available")
-	}
-
+// NewDownloader создаёт новый загрузчик.
+func NewDownloader(baseURL, userAgent, outputDir string, proxyMgr *proxymanager.ProxyManager) (*Downloader, error) {
 	return &Downloader{
 		baseURL:    baseURL,
 		userAgent:  userAgent,
-		proxies:    proxies,
 		outputDir:  outputDir,
+		proxyMgr:   proxyMgr,
 		maxRetries: 3,
 	}, nil
 }
 
-// DownloadFiles загружает список файлов многопоточно.
+// DownloadFiles загружает файлы по списку URL-ов.
 func (d *Downloader) DownloadFiles(ctx context.Context, urls []string) error {
-	var wg sync.WaitGroup
-	results := make(chan error, len(urls))
-	proxyIndex := 0
-	mu := sync.Mutex{}
-
 	log.Printf("Starting download of %d files", len(urls))
-	for i, u := range urls {
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(urls))
+
+	for i, url := range urls {
 		wg.Add(1)
-		go func(index int, fileURL string) {
+		go func(i int, url string) {
 			defer wg.Done()
-			log.Printf("Downloading file %d: %s", index+1, fileURL)
-			err := d.downloadFile(ctx, fileURL, proxyIndex)
-			if err != nil {
-				results <- fmt.Errorf("failed to download %s: %w", fileURL, err)
-				return
+			log.Printf("Downloading file %d: %s", i+1, url)
+			for attempt := 1; attempt <= d.maxRetries; attempt++ {
+				proxies, err := d.proxyMgr.GetProxies()
+				if err != nil {
+					log.Printf("Failed to get proxies: %v", err)
+					errChan <- err
+					return
+				}
+				if len(proxies) == 0 {
+					log.Printf("No proxies available")
+					errChan <- fmt.Errorf("no proxies available")
+					return
+				}
+				proxyIndex := (i + attempt - 1) % len(proxies)
+				proxyURL := proxies[proxyIndex]
+				log.Printf("Attempt %d/%d for %s using proxy %s", attempt, d.maxRetries, url, proxyURL)
+
+				err = d.downloadWithProxy(ctx, url, proxyURL)
+				if err == nil {
+					return
+				}
+				log.Printf("Failed attempt %d: %v", attempt, err)
+				time.Sleep(time.Second * time.Duration(attempt))
 			}
-			results <- nil
-			mu.Lock()
-			proxyIndex = (proxyIndex + 1) % len(d.proxies)
-			mu.Unlock()
-		}(i, u)
+			errChan <- fmt.Errorf("failed to download %s after %d attempts", url, d.maxRetries)
+		}(i, url)
 	}
 
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
+	wg.Wait()
+	close(errChan)
 
-	var errors []error
-	for err := range results {
+	for err := range errChan {
 		if err != nil {
-			errors = append(errors, err)
+			return err
 		}
-	}
-	if len(errors) > 0 {
-		return fmt.Errorf("encountered %d errors: %v", len(errors), errors)
 	}
 	log.Println("All files downloaded successfully")
 	return nil
 }
 
-// downloadFile загружает один файл с повторными попытками.
-func (d *Downloader) downloadFile(ctx context.Context, fileURL string, proxyIndex int) error {
-	var lastErr error
-	for attempt := 0; attempt < d.maxRetries; attempt++ {
-		proxyURL := d.proxies[proxyIndex]
-		log.Printf("Attempt %d/%d for %s using proxy %s", attempt+1, d.maxRetries, fileURL, proxyURL)
-		err := d.downloadWithProxy(ctx, fileURL, proxyURL)
-		if err == nil {
-			return nil
-		}
-		lastErr = err
-		log.Printf("Failed attempt %d: %v", attempt+1, err)
-		proxyIndex = (proxyIndex + 1) % len(d.proxies)
-	}
-	return fmt.Errorf("failed after %d retries: %w", d.maxRetries, lastErr)
-}
-
 // downloadWithProxy выполняет загрузку через указанный прокси.
-func (d *Downloader) downloadWithProxy(ctx context.Context, fileURL, proxyURL string) error {
-	parsedProxyURL, err := url.Parse(proxyURL)
+func (d *Downloader) downloadWithProxy(ctx context.Context, fileURL, proxyURLStr string) error {
+	proxyURL, err := url.Parse(proxyURLStr)
 	if err != nil {
-		return fmt.Errorf("invalid proxy URL %s: %w", proxyURL, err)
+		return fmt.Errorf("invalid proxy URL %s: %w", proxyURLStr, err)
 	}
-	dialer, err := proxy.FromURL(parsedProxyURL, proxy.Direct)
+
+	// Используем proxy.FromURL для socks4 и socks5 (bdandy/go-socks4 добавляет поддержку socks4)
+	dialer, err := proxy.FromURL(proxyURL, proxy.Direct)
 	if err != nil {
-		return fmt.Errorf("failed to create proxy %s: %w", proxyURL, err)
+		return fmt.Errorf("failed to create proxy %s: %w", proxyURLStr, err)
 	}
 
 	client := &http.Client{
@@ -141,7 +127,7 @@ func (d *Downloader) downloadWithProxy(ctx context.Context, fileURL, proxyURL st
 		return fmt.Errorf("unexpected status code for %s: %d", fileURL, resp.StatusCode)
 	}
 
-	// Формируем путь сохранения, сохраняя структуру REMOTE_PATH
+	// Формируем путь сохранения
 	relativePath := strings.TrimPrefix(fileURL, d.baseURL+"/")
 	outputPath := filepath.Join(d.outputDir, relativePath)
 	log.Printf("Saving file to %s", outputPath)
@@ -172,11 +158,11 @@ func (d *Downloader) downloadWithProxy(ctx context.Context, fileURL, proxyURL st
 	return nil
 }
 
-// checkZipFile проверяет, является ли файл валидным Zip-архивом.
+// checkZipFile проверяет, является ли файл валидным Zip.
 func checkZipFile(path string) error {
 	r, err := zip.OpenReader(path)
 	if err != nil {
-		return fmt.Errorf("not a valid Zip file: %w", err)
+		return err
 	}
 	r.Close()
 	return nil

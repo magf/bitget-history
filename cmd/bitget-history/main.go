@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -17,6 +18,8 @@ import (
 	"github.com/magf/bitget-history/internal/proxymanager"
 	"golang.org/x/net/proxy"
 	"gopkg.in/yaml.v3"
+
+	_ "github.com/bdandy/go-socks4" // Поддержка SOCKS4
 )
 
 // Config представляет структуру конфигурационного файла.
@@ -108,8 +111,8 @@ func main() {
 	}
 
 	// Читаем конфиг
-	configFile := "config/config.yaml"
-	configOverrideFile := "config/config-override.yaml"
+	configFile := filepath.Join("config", "config.yaml")
+	configOverrideFile := filepath.Join("config", "config-override.yaml")
 	var cfg Config
 
 	// Читаем основной конфиг
@@ -192,7 +195,7 @@ func generateURLs(baseURL, market, pair, dataType string, startDate, endDate tim
 				path := fmt.Sprintf("trades/%s/%s/%s_%03d.zip", marketCode, pair, dateStr, num)
 				url := fmt.Sprintf("%s/%s", baseURL, path)
 				// Проверяем существование файла через HEAD
-				exists, err := checkFileExists(url, proxies, userAgent)
+				exists, err := checkFileExists(url, proxies, userAgent, debug)
 				if err != nil {
 					if debug {
 						log.Printf("Error checking %s: %v", url, err)
@@ -218,7 +221,7 @@ func generateURLs(baseURL, market, pair, dataType string, startDate, endDate tim
 				path := fmt.Sprintf("depth/%s/%s/%s.zip", pair, marketCode, d.Format("20060102"))
 				url := fmt.Sprintf("%s/%s", baseURL, path)
 				// Проверяем существование файла через HEAD
-				exists, err := checkFileExists(url, proxies, userAgent)
+				exists, err := checkFileExists(url, proxies, userAgent, debug)
 				if err != nil {
 					if debug {
 						log.Printf("Error checking %s: %v", url, err)
@@ -253,16 +256,19 @@ func generateURLs(baseURL, market, pair, dataType string, startDate, endDate tim
 }
 
 // checkFileExists проверяет существование файла через HEAD-запрос.
-func checkFileExists(urlStr string, proxies []string, userAgent string) (bool, error) {
+func checkFileExists(urlStr string, proxies []string, userAgent string, debug bool) (bool, error) {
 	// Выбираем случайный прокси
 	proxyIndex := int(time.Now().UnixNano()) % len(proxies)
-	proxyURL, err := url.Parse(proxies[proxyIndex])
+	proxyURLStr := proxies[proxyIndex]
+	proxyURL, err := url.Parse(proxyURLStr)
 	if err != nil {
-		return false, fmt.Errorf("invalid proxy URL %s: %w", proxies[proxyIndex], err)
+		return false, fmt.Errorf("invalid proxy URL %s: %w", proxyURLStr, err)
 	}
+
+	// Используем proxy.FromURL для socks4 и socks5 (bdandy/go-socks4 добавляет поддержку socks4)
 	dialer, err := proxy.FromURL(proxyURL, proxy.Direct)
 	if err != nil {
-		return false, fmt.Errorf("failed to create proxy %s: %w", proxies[proxyIndex], err)
+		return false, fmt.Errorf("failed to create proxy %s: %w", proxyURLStr, err)
 	}
 
 	client := &http.Client{
@@ -284,6 +290,9 @@ func checkFileExists(urlStr string, proxies []string, userAgent string) (bool, e
 	}
 	resp.Body.Close()
 
+	if debug {
+		log.Printf("Checked %s with proxy %s: status %d", urlStr, proxyURLStr, resp.StatusCode)
+	}
 	return resp.StatusCode >= 200 && resp.StatusCode < 400, nil
 }
 
