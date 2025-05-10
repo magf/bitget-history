@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -257,43 +258,71 @@ func generateURLs(baseURL, market, pair, dataType string, startDate, endDate tim
 
 // checkFileExists проверяет существование файла через HEAD-запрос.
 func checkFileExists(urlStr string, proxies []string, userAgent string, debug bool) (bool, error) {
-	// Выбираем случайный прокси
-	proxyIndex := int(time.Now().UnixNano()) % len(proxies)
-	proxyURLStr := proxies[proxyIndex]
-	proxyURL, err := url.Parse(proxyURLStr)
-	if err != nil {
-		return false, fmt.Errorf("invalid proxy URL %s: %w", proxyURLStr, err)
-	}
+	maxAttempts := 3
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		// Выбираем случайный прокси
+		proxyIndex := rand.Intn(len(proxies))
+		proxyURLStr := proxies[proxyIndex]
+		proxyURL, err := url.Parse(proxyURLStr)
+		if err != nil {
+			if debug {
+				log.Printf("Invalid proxy URL %s: %v", proxyURLStr, err)
+			}
+			lastErr = err
+			continue
+		}
 
-	// Используем proxy.FromURL для socks4 и socks5 (bdandy/go-socks4 добавляет поддержку socks4)
-	dialer, err := proxy.FromURL(proxyURL, proxy.Direct)
-	if err != nil {
-		return false, fmt.Errorf("failed to create proxy %s: %w", proxyURLStr, err)
-	}
+		dialer, err := proxy.FromURL(proxyURL, proxy.Direct)
+		if err != nil {
+			if debug {
+				log.Printf("Failed to create proxy %s: %v", proxyURLStr, err)
+			}
+			lastErr = err
+			continue
+		}
 
-	client := &http.Client{
-		Transport: &http.Transport{
-			Dial: dialer.Dial,
-		},
-		Timeout: 10 * time.Second,
-	}
+		client := &http.Client{
+			Transport: &http.Transport{
+				Dial: dialer.Dial,
+			},
+			Timeout: 15 * time.Second,
+		}
 
-	req, err := http.NewRequest("HEAD", urlStr, nil)
-	if err != nil {
-		return false, err
-	}
-	req.Header.Set("User-Agent", userAgent)
+		req, err := http.NewRequest("HEAD", urlStr, nil)
+		if err != nil {
+			if debug {
+				log.Printf("Failed to create request for %s: %v", urlStr, err)
+			}
+			lastErr = err
+			continue
+		}
+		req.Header.Set("User-Agent", userAgent)
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return false, err
-	}
-	resp.Body.Close()
+		resp, err := client.Do(req)
+		if err != nil {
+			if debug {
+				log.Printf("Attempt %d: Failed to HEAD %s with proxy %s: %v", attempt, urlStr, proxyURLStr, err)
+			}
+			lastErr = err
+			continue
+		}
+		resp.Body.Close()
 
+		if debug {
+			log.Printf("Checked %s with proxy %s: status %d", urlStr, proxyURLStr, resp.StatusCode)
+		}
+		// Явно считаем файл существующим только при 200-399, иначе прерываем при 400+
+		if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+			return true, nil
+		} else if resp.StatusCode >= 400 {
+			return false, nil
+		}
+	}
 	if debug {
-		log.Printf("Checked %s with proxy %s: status %d", urlStr, proxyURLStr, resp.StatusCode)
+		log.Printf("File %s skipped after %d attempts due to error: %v", urlStr, maxAttempts, lastErr)
 	}
-	return resp.StatusCode >= 200 && resp.StatusCode < 400, nil
+	return false, fmt.Errorf("failed to check %s after %d attempts: %v", urlStr, maxAttempts, lastErr)
 }
 
 // readProxyCount читает количество прокси из файла.

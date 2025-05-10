@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -45,13 +46,14 @@ func (d *Downloader) DownloadFiles(ctx context.Context, urls []string) error {
 	log.Printf("Starting download of %d files", len(urls))
 	var wg sync.WaitGroup
 	errChan := make(chan error, len(urls))
+	badProxies := make(map[string]struct{}) // Кэш нерабочих прокси
 
 	for i, url := range urls {
 		wg.Add(1)
 		go func(i int, url string) {
 			defer wg.Done()
 			log.Printf("Downloading file %d: %s", i+1, url)
-			for attempt := 1; attempt <= d.maxRetries; attempt++ {
+			for attempt := 1; attempt <= 5; attempt++ { // Увеличиваем до 5 попыток
 				proxies, err := d.proxyMgr.GetProxies()
 				if err != nil {
 					log.Printf("Failed to get proxies: %v", err)
@@ -63,18 +65,37 @@ func (d *Downloader) DownloadFiles(ctx context.Context, urls []string) error {
 					errChan <- fmt.Errorf("no proxies available")
 					return
 				}
-				proxyIndex := (i + attempt - 1) % len(proxies)
-				proxyURL := proxies[proxyIndex]
-				log.Printf("Attempt %d/%d for %s using proxy %s", attempt, d.maxRetries, url, proxyURL)
+
+				// Фильтруем нерабочие прокси
+				var availableProxies []string
+				for _, p := range proxies {
+					if _, bad := badProxies[p]; !bad {
+						availableProxies = append(availableProxies, p)
+					}
+				}
+				if len(availableProxies) == 0 {
+					log.Printf("All proxies marked as bad for %s", url)
+					errChan <- fmt.Errorf("no good proxies left for %s", url)
+					return
+				}
+
+				proxyIndex := rand.Intn(len(availableProxies))
+				proxyURL := availableProxies[proxyIndex]
+				log.Printf("Attempt %d/5 for %s using proxy %s", attempt, url, proxyURL)
 
 				err = d.downloadWithProxy(ctx, url, proxyURL)
 				if err == nil {
 					return
 				}
 				log.Printf("Failed attempt %d: %v", attempt, err)
+				// Помечаем прокси как нерабочий при определённых ошибках
+				if strings.Contains(err.Error(), "connection refused") || strings.Contains(err.Error(), "timeout") {
+					badProxies[proxyURL] = struct{}{}
+					log.Printf("Marked proxy %s as bad", proxyURL)
+				}
 				time.Sleep(time.Second * time.Duration(attempt))
 			}
-			errChan <- fmt.Errorf("failed to download %s after %d attempts", url, d.maxRetries)
+			errChan <- fmt.Errorf("failed to download %s after 5 attempts", url)
 		}(i, url)
 	}
 
