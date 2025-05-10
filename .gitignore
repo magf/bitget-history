@@ -1,1 +1,10 @@
-/data
+bak/
+bin/
+*.log
+*.test
+*.prof
+data/
+/tmp/bitget_*
+config/config.yaml
+debian/
+*.deb
