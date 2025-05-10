@@ -10,7 +10,7 @@ PROXY_FILE="$DATA_DIR/proxies.txt"
 CONFIG_FILE="$DATA_DIR/config"
 USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 
-# # Примеры использования локального прокси для получения списков прокси, если дуступ на cdn.jsdelivr.net закрыт
+# Примеры использования локального прокси для получения списков прокси
 # MY_PROXY="http://1.2.3.4:3128"
 # MY_PROXY="socks5://1.2.3.4:1080"
 
@@ -19,35 +19,65 @@ USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 # Функция для логирования
 log() {
     echo "$(date '+%Y/%m/%d %H:%M:%S') $1"
-}
+} ; export -f log
 
-# Функция для скачивания списка прокси
-download_proxy_list() {
-    log "Скачиваем списки прокси..."
-    mkdir -p "$DATA_DIR"
-    for proto in 4 5; do
-        local url="https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks$proto/data.txt"
-        log "Скачиваем $url..."
-        if curl ${MY_PROXY:+-x $MY_PROXY }-s -o - "$url" >> "$PROXY_FILE"; then
-            log "Успешно скачан $url"
-            echo '' >> "$PROXY_FILE"
-        else
-            log "Ошибка скачивания $url"
-        fi
-    done
+# Функция для отладочного вывода
+debug() {
+    [ -n "$DEBUG" ] && log "$1" || true
+} ; export -f debug
 
-    if [ ! -s "$PROXY_FILE" ]; then
-        log "Ошибка: Файл прокси пуст после скачивания"
+# Функция для вывода ошибки и завершения
+err() {
+    echo "$(date '+%Y/%m/%d %H:%M:%S') Ошибка: $1" >&2
+    exit 1
+} ; export -f err
+
+# Функция для проверки типа файла
+check_file_type() {
+    local file_path="$1"
+    local expected_type="$2"
+    local file_output
+
+    if [ ! -f "$file_path" ] || [ ! -s "$file_path" ]; then
+        debug "Файл $file_path не существует или пуст"
         return 1
     fi
-    return 0
+
+    file_output=$(file "$file_path")
+    debug "Проверка типа файла $file_path: $file_output"
+
+    case "$expected_type" in
+        zip)
+            if echo "$file_output" | grep -q "Zip archive data"; then
+                debug "Файл $file_path является корректным Zip-архивом"
+                return 0
+            else
+                log "Файл $file_path не является Zip-архивом: $file_output"
+                return 1
+            fi
+            ;;
+        csv)
+            if echo "$file_output" | grep -q -E "ASCII text|UTF-8 Unicode text"; then
+                debug "Файл $file_path является корректным CSV-файлом"
+                return 0
+            else
+                log "Файл $file_path не является CSV-файлом: $file_output"
+                return 1
+            fi
+            ;;
+        *)
+            err "Неизвестный тип файла: $expected_type"
+            ;;
+    esac
 }
 
 # Функция для получения рандомного прокси
 get_random_proxy() {
-    [ -f "$PROXY_FILE" ] || { download_proxy_list || { log "Ошибка: Не удалось скачать список прокси"; return 1; } }
+    if [ ! -f "$PROXY_FILE" ] || [ ! -s "$PROXY_FILE" ]; then
+        err "Файл рабочих прокси отсутствует или пуст: $PROXY_FILE. Запустите check_proxies.sh"
+    fi
 
-    log "Читаем список прокси из $PROXY_FILE..."
+    debug "Читаем список прокси из $PROXY_FILE..."
     local proxies=()
     while IFS= read -r line; do
         [ -n "$line" ] && proxies+=("$line")
@@ -55,29 +85,26 @@ get_random_proxy() {
 
     local count=${#proxies[@]}
     if [ "$count" -eq 0 ]; then
-        log "Ошибка: Список прокси пуст после чтения"
-        return 1
+        err "Список прокси пуст: $PROXY_FILE"
     fi
-    log "Найдено $count прокси"
+    debug "Найдено $count прокси"
 
-    for ((i=1; i<=30; i++)); do
-        local index=$((RANDOM % count))
-        local proxy=${proxies[$index]}
-        log "Попытка $i: Проверяем прокси $proxy..."
-        result=$(curl -s --insecure --connect-timeout 3 -x "$proxy" https://ifconfig.io)
-        proxy_ip=${proxy#*://}
-        proxy_ip=${proxy_ip%%:*}
-        log "Ожидается '$proxy_ip'. Получено '$result'"
-        if [ $? -eq 0 ] && [ "$result" = "$proxy_ip" ]; then
-            log "Прокси $proxy доступен, возвращает IP $result"
-            export PROXY="$proxy"
-            return 0
-        fi
-        log "Прокси $proxy недоступен или возвращает неверный IP ($result)"
-    done
+    local index=$((RANDOM % count))
+    local proxy=${proxies[$index]}
+    log "Выбран прокси $proxy"
+    export PROXY="$proxy"
+}
 
-    log "Ошибка: Не удалось найти доступный прокси после 30 попыток"
-    return 1
+# Функция для вычисления коэффициента ротации
+calculate_rotation_factor() {
+    local days=$(( (END_DATE_EPOCH - START_DATE_EPOCH) / 86400 + 1 ))
+    local proxy_count=$(wc -l < "$PROXY_FILE" | tr -d ' ')
+    if [ "$proxy_count" -eq 0 ]; then
+        err "Список прокси пуст: $PROXY_FILE"
+    fi
+    local factor=$(( (days + proxy_count - 1) / proxy_count )) # Округление вверх
+    debug "Дней: $days, Прокси: $proxy_count, Коэффициент ротации: $factor" >&2
+    echo "$factor"
 }
 
 # Функция для инициализации SQLite базы
@@ -103,6 +130,7 @@ CREATE TABLE IF NOT EXISTS depth (
 CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);
 CREATE INDEX IF NOT EXISTS idx_depth_timestamp ON depth(timestamp);
 EOF
+#  catastrophically failed to execute
     log "Инициализирована база $db_path"
 }
 
@@ -112,8 +140,8 @@ import_to_db() {
     local table_name="$2"
     local csv_path="$3"
 
-    if [ ! -f "$csv_path" ] || [ ! -s "$csv_path" ]; then
-        log "Ошибка: CSV-файл $csv_path не существует или пуст"
+    if ! check_file_type "$csv_path" csv; then
+        log "Пропускаем импорт некорректного CSV-файла $csv_path"
         return 1
     fi
 
@@ -156,6 +184,8 @@ START_DATE=$(date -d "1 year ago" +%Y-%m-%d)
 END_DATE=$(date +%Y-%m-%d)
 DATA_TYPE=""
 MARKET="spot"
+DEBUG=""
+MAX_RETRIES=3
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -164,18 +194,17 @@ while [ $# -gt 0 ]; do
         --end-date) END_DATE="$2"; shift 2 ;;
         --type) DATA_TYPE="$2"; shift 2 ;;
         --market) MARKET="$2"; shift 2 ;;
-        *) echo "Неизвестный аргумент: $1"; exit 1 ;;
+        --debug) DEBUG=1; shift ;;
+        *) err "Неизвестный аргумент: $1" ;;
     esac
 done
 
 if [ -z "$DATA_TYPE" ] || [ "$DATA_TYPE" != "trades" ] && [ "$DATA_TYPE" != "depth" ]; then
-    echo "Ошибка: --type должен быть 'trades' или 'depth'"
-    exit 1
+    err "Тип данных должен быть 'trades' или 'depth'"
 fi
 
 if [ "$MARKET" != "spot" ] && [ "$MARKET" != "futures" ]; then
-    echo "Ошибка: --market должен быть 'spot' или 'futures'"
-    exit 1
+    err "Рынок должен быть 'spot' или 'futures'"
 fi
 
 # Конвертация дат
@@ -183,28 +212,25 @@ START_DATE_EPOCH=$(date -d "$START_DATE" +%s)
 END_DATE_EPOCH=$(date -d "$END_DATE" +%s)
 
 if [ $START_DATE_EPOCH -gt $END_DATE_EPOCH ]; then
-    log "Неверный интервал. Начальная дата больше конечной"
-    exit 1
+    err "Начальная дата больше конечной"
 fi
 
 # Инициализация базы данных
 DB_PATH="$DB_DIR/history_${PAIR}_${MARKET}.db"
 init_db "$DB_PATH"
 
-# Получение прокси
+# Получение первого прокси
 log "Получаем рабочий прокси..."
 unset PROXY
 get_random_proxy
-if [ $? -ne 0 ]; then
-    log "Критическая ошибка: Не удалось получить прокси"
-    exit 1
-fi
-log "Прокси $PROXY"
 if [ -z "$PROXY" ]; then
-    log "Критическая ошибка: Прокси не выбран (пустая строка)"
-    exit 1
+    err "Прокси не выбран (пустая строка)"
 fi
 log "Используем прокси: $PROXY"
+
+# Вычисление коэффициента ротации
+ROTATION_FACTOR=$(calculate_rotation_factor)
+DOWNLOAD_COUNTER=0
 
 # Основной цикл по датам
 CURRENT_DATE=$START_DATE_EPOCH
@@ -221,23 +247,54 @@ while [ $CURRENT_DATE -le $END_DATE_EPOCH ]; do
             CSV_PATH="$CSV_DIR/trades/${MARKET_CODE}/${PAIR}/${DATE_STR}_${NUM}.csv"
             mkdir -p "$(dirname "$LOCAL_ZIP")" "$(dirname "$CSV_PATH")"
 
-            # Зеркалирование
-            if [ -f "$LOCAL_ZIP" ] && [ -s "$LOCAL_ZIP" ]; then
-                log "Файл $LOCAL_ZIP уже существует, пропускаем скачивание"
-            else
-                log "Скачиваем $BASE_URL/$REMOTE_PATH..."
-                curl --insecure -s -x "$PROXY" -A "$USER_AGENT" -o "$LOCAL_ZIP" "$BASE_URL/$REMOTE_PATH"
-                if [ $? -ne 0 ] || [ ! -s "$LOCAL_ZIP" ]; then
-                    log "Ошибка скачивания $BASE_URL/$REMOTE_PATH (вероятно, файл не существует), прерываем для этой даты"
+            # Проверка существующего zip
+            if [ -f "$LOCAL_ZIP" ]; then
+                if check_file_type "$LOCAL_ZIP" zip; then
+                    log "Файл $LOCAL_ZIP уже существует, пропускаем скачивание"
+                else
+                    log "Удаляем некорректный файл $LOCAL_ZIP"
                     rm -f "$LOCAL_ZIP"
-                    break
+                fi
+            fi
+
+            # Зеркалирование
+            if [ ! -f "$LOCAL_ZIP" ]; then
+                log "Скачиваем $BASE_URL/$REMOTE_PATH..."
+                curl_output=$(curl --insecure -s -x "$PROXY" -A "$USER_AGENT" --connect-timeout 20 --max-time 60 --write-out "%{http_code}" -o "$LOCAL_ZIP" "$BASE_URL/$REMOTE_PATH" 2>/dev/null)
+                DOWNLOAD_COUNTER=$((DOWNLOAD_COUNTER + 1))
+                debug "HTTP-код: $curl_output"
+
+                if [ $? -eq 0 ] && [ -s "$LOCAL_ZIP" ] && [ "$curl_output" = "200" ]; then
+                    if ! check_file_type "$LOCAL_ZIP" zip; then
+                        log "Удаляем некорректный файл $LOCAL_ZIP после скачивания"
+                        rm -f "$LOCAL_ZIP"
+                    fi
+                else
+                    log "Не удалось скачать $BASE_URL/$REMOTE_PATH (HTTP-код: $curl_output)"
+                    rm -f "$LOCAL_ZIP"
+                fi
+
+                # Ротация прокси по коэффициенту
+                if [ "$DOWNLOAD_COUNTER" -ge "$ROTATION_FACTOR" ]; then
+                    log "Ротация прокси (скачиваний: $DOWNLOAD_COUNTER, коэффициент: $ROTATION_FACTOR)"
+                    get_random_proxy
+                    log "Используем прокси: $PROXY"
+                    DOWNLOAD_COUNTER=0
+                fi
+            fi
+
+            # Проверка существующего csv
+            if [ -f "$CSV_PATH" ]; then
+                if check_file_type "$CSV_PATH" csv; then
+                    log "CSV $CSV_PATH уже существует, пропускаем распаковку"
+                else
+                    log "Удаляем некорректный файл $CSV_PATH"
+                    rm -f "$CSV_PATH"
                 fi
             fi
 
             # Распаковка и конвертирование
-            if [ -f "$CSV_PATH" ] && [ -s "$CSV_PATH" ]; then
-                log "CSV $CSV_PATH уже существует, пропускаем распаковку"
-            else
+            if [ ! -f "$CSV_PATH" ]; then
                 log "Распаковываем $LOCAL_ZIP в $TMP_DIR..."
                 mkdir -p "$TMP_DIR"
                 unzip -o "$LOCAL_ZIP" -d "$TMP_DIR" || { log "Ошибка распаковки $LOCAL_ZIP"; rm -rf "$TMP_DIR"; break; }
@@ -262,28 +319,64 @@ while [ $CURRENT_DATE -le $END_DATE_EPOCH ]; do
         # Проверяем альтернативную папку (1 или 2)
         ALT_MARKET_CODE=$([ "$MARKET_CODE" = "1" ] && echo "2" || echo "1")
         ALT_LOCAL_ZIP="$OFFLINE_DIR/depth/${PAIR}/${ALT_MARKET_CODE}/${DATE_STR}.zip"
-        if [ -f "$ALT_LOCAL_ZIP" ] && [ -s "$ALT_LOCAL_ZIP" ]; then
-            log "Файл $ALT_LOCAL_ZIP уже существует, используем его"
-            LOCAL_ZIP="$ALT_LOCAL_ZIP"
+        if [ -f "$ALT_LOCAL_ZIP" ]; then
+            if check_file_type "$ALT_LOCAL_ZIP" zip; then
+                log "Файл $ALT_LOCAL_ZIP уже существует, используем его"
+                LOCAL_ZIP="$ALT_LOCAL_ZIP"
+            else
+                log "Удаляем некорректный файл $ALT_LOCAL_ZIP"
+                rm -f "$ALT_LOCAL_ZIP"
+            fi
+        fi
+
+        # Проверка существующего zip
+        if [ -f "$LOCAL_ZIP" ]; then
+            if check_file_type "$LOCAL_ZIP" zip; then
+                log "Файл $LOCAL_ZIP уже существует, пропускаем скачивание"
+            else
+                log "Удаляем некорректный файл $LOCAL_ZIP"
+                rm -f "$LOCAL_ZIP"
+            fi
         fi
 
         # Зеркалирование
-        if [ -f "$LOCAL_ZIP" ] && [ -s "$LOCAL_ZIP" ]; then
-            log "Файл $LOCAL_ZIP уже существует, пропускаем скачивание"
-        else
+        if [ ! -f "$LOCAL_ZIP" ]; then
             log "Скачиваем $BASE_URL/$REMOTE_PATH..."
-            curl --insecure -s -x "$PROXY" -A "$USER_AGENT" -o "$LOCAL_ZIP" "$BASE_URL/$REMOTE_PATH"
-            if [ $? -ne 0 ] || [ ! -s "$LOCAL_ZIP" ]; then
-                log "Ошибка скачивания $BASE_URL/$REMOTE_PATH или файл пуст, пропускаем дату"
+            curl_output=$(curl --insecure -s -x "$PROXY" -A "$USER_AGENT" --connect-timeout 5 --max-time 30 --write-out "%{http_code}" -o "$LOCAL_ZIP" "$BASE_URL/$REMOTE_PATH" 2>/dev/null)
+            DOWNLOAD_COUNTER=$((DOWNLOAD_COUNTER + 1))
+            debug "HTTP-код: $curl_output"
+
+            if [ $? -eq 0 ] && [ -s "$LOCAL_ZIP" ] && [ "$curl_output" = "200" ]; then
+                if ! check_file_type "$LOCAL_ZIP" zip; then
+                    log "Удаляем некорректный файл $LOCAL_ZIP после скачивания"
+                    rm -f "$LOCAL_ZIP"
+                fi
+            else
+                log "Не удалось скачать $BASE_URL/$REMOTE_PATH (HTTP-код: $curl_output)"
                 rm -f "$LOCAL_ZIP"
-                continue
+            fi
+
+            # Ротация прокси по коэффициенту
+            if [ "$DOWNLOAD_COUNTER" -ge "$ROTATION_FACTOR" ]; then
+                log "Ротация прокси (скачиваний: $DOWNLOAD_COUNTER, коэффициент: $ROTATION_FACTOR)"
+                get_random_proxy
+                log "Используем прокси: $PROXY"
+                DOWNLOAD_COUNTER=0
+            fi
+        fi
+
+        # Проверка существующего csv
+        if [ -f "$CSV_PATH" ]; then
+            if check_file_type "$CSV_PATH" csv; then
+                log "CSV $CSV_PATH уже существует, пропускаем конвертацию"
+            else
+                log "Удаляем некорректный файл $CSV_PATH"
+                rm -f "$CSV_PATH"
             fi
         fi
 
         # Распаковка и конвертирование
-        if [ -f "$CSV_PATH" ] && [ -s "$CSV_PATH" ]; then
-            log "CSV $CSV_PATH уже существует, пропускаем конвертацию"
-        else
+        if [ -f "$LOCAL_ZIP" ] && [ ! -f "$CSV_PATH" ]; then
             log "Распаковываем $LOCAL_ZIP в $TMP_DIR..."
             mkdir -p "$TMP_DIR"
             unzip -o "$LOCAL_ZIP" -d "$TMP_DIR" || { log "Ошибка распаковки $LOCAL_ZIP"; rm -rf "$TMP_DIR"; continue; }
