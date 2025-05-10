@@ -37,7 +37,7 @@ func NewDownloader(baseURL, userAgent, outputDir string, proxyMgr *proxymanager.
 		userAgent:  userAgent,
 		outputDir:  outputDir,
 		proxyMgr:   proxyMgr,
-		maxRetries: 3,
+		maxRetries: 10,
 	}, nil
 }
 
@@ -46,6 +46,8 @@ func (d *Downloader) DownloadFiles(ctx context.Context, urls []string) error {
 	log.Printf("Starting download of %d files", len(urls))
 	var wg sync.WaitGroup
 	errChan := make(chan error, len(urls))
+	failedURLs := make([]string, 0)
+	var mu sync.Mutex
 	badProxies := make(map[string]struct{}) // Кэш нерабочих прокси
 
 	for i, url := range urls {
@@ -53,7 +55,7 @@ func (d *Downloader) DownloadFiles(ctx context.Context, urls []string) error {
 		go func(i int, url string) {
 			defer wg.Done()
 			log.Printf("Downloading file %d: %s", i+1, url)
-			for attempt := 1; attempt <= 5; attempt++ { // Увеличиваем до 5 попыток
+			for attempt := 1; attempt <= d.maxRetries; attempt++ {
 				proxies, err := d.proxyMgr.GetProxies()
 				if err != nil {
 					log.Printf("Failed to get proxies: %v", err)
@@ -75,13 +77,16 @@ func (d *Downloader) DownloadFiles(ctx context.Context, urls []string) error {
 				}
 				if len(availableProxies) == 0 {
 					log.Printf("All proxies marked as bad for %s", url)
+					mu.Lock()
+					failedURLs = append(failedURLs, url)
+					mu.Unlock()
 					errChan <- fmt.Errorf("no good proxies left for %s", url)
 					return
 				}
 
 				proxyIndex := rand.Intn(len(availableProxies))
 				proxyURL := availableProxies[proxyIndex]
-				log.Printf("Attempt %d/5 for %s using proxy %s", attempt, url, proxyURL)
+				log.Printf("Attempt %d/%d for %s using proxy %s", attempt, d.maxRetries, url, proxyURL)
 
 				err = d.downloadWithProxy(ctx, url, proxyURL)
 				if err == nil {
@@ -95,7 +100,10 @@ func (d *Downloader) DownloadFiles(ctx context.Context, urls []string) error {
 				}
 				time.Sleep(time.Second * time.Duration(attempt))
 			}
-			errChan <- fmt.Errorf("failed to download %s after 5 attempts", url)
+			mu.Lock()
+			failedURLs = append(failedURLs, url)
+			mu.Unlock()
+			errChan <- fmt.Errorf("failed to download %s after %d attempts", url, d.maxRetries)
 		}(i, url)
 	}
 
@@ -104,8 +112,13 @@ func (d *Downloader) DownloadFiles(ctx context.Context, urls []string) error {
 
 	for err := range errChan {
 		if err != nil {
-			return err
+			log.Printf("Download error: %v", err)
 		}
+	}
+
+	if len(failedURLs) > 0 {
+		log.Printf("Failed to download the following files: %v", failedURLs)
+		return fmt.Errorf("failed to download %d files", len(failedURLs))
 	}
 	log.Println("All files downloaded successfully")
 	return nil
@@ -118,7 +131,7 @@ func (d *Downloader) downloadWithProxy(ctx context.Context, fileURL, proxyURLStr
 		return fmt.Errorf("invalid proxy URL %s: %w", proxyURLStr, err)
 	}
 
-	// Используем proxy.FromURL для socks4 и socks5 (bdandy/go-socks4 добавляет поддержку socks4)
+	// Используем proxy.FromURL для socks4 и socks5
 	dialer, err := proxy.FromURL(proxyURL, proxy.Direct)
 	if err != nil {
 		return fmt.Errorf("failed to create proxy %s: %w", proxyURLStr, err)
@@ -128,7 +141,7 @@ func (d *Downloader) downloadWithProxy(ctx context.Context, fileURL, proxyURLStr
 		Transport: &http.Transport{
 			Dial: dialer.Dial,
 		},
-		Timeout: 30 * time.Second,
+		Timeout: 60 * time.Second,
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "GET", fileURL, nil)
@@ -139,7 +152,7 @@ func (d *Downloader) downloadWithProxy(ctx context.Context, fileURL, proxyURLStr
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to GET %s with proxy %s: %w", fileURL, proxyURLStr, err)
 	}
 	defer resp.Body.Close()
 
