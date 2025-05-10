@@ -87,7 +87,7 @@ func (d *Downloader) DownloadFiles(ctx context.Context, urls []string) error {
 				if err == nil {
 					return
 				}
-				log.Printf("Failed attempt %d: %v", attempt, err)
+				log.Printf("Failed attempt %d for %s with proxy %s: %v", attempt, url, proxyURL, err)
 				// Помечаем прокси как нерабочий при определённых ошибках
 				if strings.Contains(err.Error(), "connection refused") || strings.Contains(err.Error(), "timeout") {
 					badProxies[proxyURL] = struct{}{}
