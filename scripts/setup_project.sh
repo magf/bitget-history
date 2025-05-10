@@ -74,7 +74,7 @@ func main() {
 EOF
     fi
 
-    # internal/proxy/proxy.go
+    # internal/proxymanager/proxymanager.go
     if [ ! -f "$INTERNAL_DIR/proxy/proxy.go" ]; then
         cat > "$INTERNAL_DIR/proxy/proxy.go" <<EOF
 package proxy
@@ -330,4 +330,4 @@ log "1. Проверьте go.mod и добавьте актуальные ве�
 log "2. Запустите 'go mod tidy' для очистки зависимостей."
 log "3. Скомпилируйте: 'make build'"
 log "4. Создайте Debian-пакет: 'make deb'"
-log "5. Начните разработку с internal/proxy/proxy.go."
+log "5. Начните разработку с internal/proxymanager/proxymanager.go."

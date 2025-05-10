@@ -5,6 +5,6 @@ bin/
 *.prof
 data/
 /tmp/bitget_*
-config/config.yaml
+config/config-override.yaml
 debian/
 *.deb

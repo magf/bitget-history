@@ -1,4 +1,4 @@
-package proxy
+package proxymanager
 
 import (
 	"bufio"
@@ -21,14 +21,20 @@ type ProxyManager struct {
 	rawFile     string
 	workingFile string
 	fallback    string
+	username    string
+	password    string
+	timeout     time.Duration
 }
 
 // NewProxyManager создаёт новый менеджер прокси.
-func NewProxyManager(rawFile, workingFile, fallback string) (*ProxyManager, error) {
+func NewProxyManager(rawFile, workingFile, fallback, username, password string, timeout time.Duration) (*ProxyManager, error) {
 	return &ProxyManager{
 		rawFile:     rawFile,
 		workingFile: workingFile,
 		fallback:    fallback,
+		username:    username,
+		password:    password,
+		timeout:     timeout,
 	}, nil
 }
 
@@ -91,7 +97,16 @@ func (pm *ProxyManager) downloadProxies(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("invalid fallback proxy URL: %w", err)
 		}
-		dialer, err := proxy.FromURL(proxyURL, proxy.Direct)
+		var dialer proxy.Dialer
+		if pm.username != "" && pm.password != "" {
+			auth := &proxy.Auth{
+				User:     pm.username,
+				Password: pm.password,
+			}
+			dialer, err = proxy.SOCKS5("tcp", proxyURL.Host, auth, proxy.Direct)
+		} else {
+			dialer, err = proxy.FromURL(proxyURL, proxy.Direct)
+		}
 		if err != nil {
 			return fmt.Errorf("failed to create fallback proxy: %w", err)
 		}
@@ -161,7 +176,7 @@ func (pm *ProxyManager) checkProxies(ctx context.Context, proxies []string) ([]s
 		wg.Add(1)
 		go func(proxyURL string) {
 			defer wg.Done()
-			ok, err := checkProxy(ctx, proxyURL)
+			ok, err := pm.checkProxy(ctx, proxyURL)
 			if err != nil {
 				return
 			}
@@ -188,7 +203,7 @@ func (pm *ProxyManager) checkProxies(ctx context.Context, proxies []string) ([]s
 }
 
 // checkProxy проверяет работоспособность одного прокси.
-func checkProxy(ctx context.Context, proxyURL string) (bool, error) {
+func (pm *ProxyManager) checkProxy(ctx context.Context, proxyURL string) (bool, error) {
 	proxyURL = strings.Replace(proxyURL, "socks4://", "socks5://", 1) // Унифицируем для SOCKS5
 	parsedURL, err := url.Parse(proxyURL)
 	if err != nil {
@@ -204,7 +219,7 @@ func checkProxy(ctx context.Context, proxyURL string) (bool, error) {
 	}
 	client := &http.Client{
 		Transport: transport,
-		Timeout:   5 * time.Second,
+		Timeout:   pm.timeout,
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "GET", "https://ifconfig.io", nil)
@@ -248,7 +263,7 @@ func (pm *ProxyManager) saveProxies(proxies []string) error {
 	return nil
 }
 
-// GetProxies возвращает список рабочих прокси для потоков.
+// GetProxies возвращает список рабочих прокси.
 func (pm *ProxyManager) GetProxies() ([]string, error) {
 	return pm.loadProxies(pm.workingFile)
 }
