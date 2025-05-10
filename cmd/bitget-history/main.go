@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/magf/bitget-history/internal/downloader"
@@ -183,6 +184,8 @@ func main() {
 func generateURLs(baseURL, market, pair, dataType string, startDate, endDate time.Time, debug bool, proxies []string, userAgent string) ([]string, error) {
 	var urls []string
 	days := int(endDate.Sub(startDate).Hours()/24) + 1
+	var mu sync.Mutex
+	var wg sync.WaitGroup
 
 	if dataType == "trades" {
 		marketCode := "SPBL"
@@ -191,28 +194,53 @@ func generateURLs(baseURL, market, pair, dataType string, startDate, endDate tim
 		}
 		for d := startDate; !d.After(endDate); d = d.AddDate(0, 0, 1) {
 			dateStr := d.Format("20060102")
-			// Пробуем файлы _001, _002, ... пока код < 400
-			for num := 1; num <= 999; num++ {
-				path := fmt.Sprintf("trades/%s/%s/%s_%03d.zip", marketCode, pair, dateStr, num)
-				url := fmt.Sprintf("%s/%s", baseURL, path)
-				// Проверяем существование файла через HEAD
-				exists, err := checkFileExists(url, proxies, userAgent, debug)
-				if err != nil {
-					if debug {
-						log.Printf("Error checking %s: %v", url, err)
-					}
-					continue
+			// Проверяем файлы пачками по 10
+			for startNum := 1; startNum <= 999; startNum += 10 {
+				endNum := startNum + 9
+				if endNum > 999 {
+					endNum = 999
 				}
-				if !exists {
-					if debug {
-						log.Printf("Stopping at %s: file does not exist", url)
-					}
-					break
+				batchURLs := make([]string, 0, endNum-startNum+1)
+				for num := startNum; num <= endNum; num++ {
+					path := fmt.Sprintf("trades/%s/%s/%s_%03d.zip", marketCode, pair, dateStr, num)
+					url := fmt.Sprintf("%s/%s", baseURL, path)
+					batchURLs = append(batchURLs, url)
 				}
-				if debug {
-					log.Printf("Generated URL: %s", url)
+
+				// Параллельная проверка пачки
+				stopBatch := false
+				for _, url := range batchURLs {
+					wg.Add(1)
+					go func(url string) {
+						defer wg.Done()
+						exists, err := checkFileExists(url, proxies, userAgent, debug)
+						if err != nil {
+							if debug {
+								log.Printf("Error checking %s: %v", url, err)
+							}
+							return
+						}
+						if !exists {
+							if debug {
+								log.Printf("Stopping at %s: file does not exist", url)
+							}
+							mu.Lock()
+							stopBatch = true
+							mu.Unlock()
+							return
+						}
+						mu.Lock()
+						urls = append(urls, url)
+						mu.Unlock()
+						if debug {
+							log.Printf("Generated URL: %s", url)
+						}
+					}(url)
 				}
-				urls = append(urls, url)
+				wg.Wait()
+				if stopBatch {
+					break // Прерываем цикл для этой даты
+				}
 			}
 		}
 	} else { // depth
@@ -221,27 +249,35 @@ func generateURLs(baseURL, market, pair, dataType string, startDate, endDate tim
 			for d := startDate; !d.After(endDate); d = d.AddDate(0, 0, 1) {
 				path := fmt.Sprintf("depth/%s/%s/%s.zip", pair, marketCode, d.Format("20060102"))
 				url := fmt.Sprintf("%s/%s", baseURL, path)
-				// Проверяем существование файла через HEAD
-				exists, err := checkFileExists(url, proxies, userAgent, debug)
-				if err != nil {
-					if debug {
-						log.Printf("Error checking %s: %v", url, err)
+
+				wg.Add(1)
+				go func(url string) {
+					defer wg.Done()
+					exists, err := checkFileExists(url, proxies, userAgent, debug)
+					if err != nil {
+						if debug {
+							log.Printf("Error checking %s: %v", url, err)
+						}
+						return
 					}
-					continue
-				}
-				if !exists {
-					if debug {
-						log.Printf("Skipping %s: file does not exist", url)
+					if !exists {
+						if debug {
+							log.Printf("Skipping %s: file does not exist", url)
+						}
+						return
 					}
-					continue
-				}
-				if debug {
-					log.Printf("Generated URL: %s", url)
-				}
-				urls = append(urls, url)
+					mu.Lock()
+					urls = append(urls, url)
+					mu.Unlock()
+					if debug {
+						log.Printf("Generated URL: %s", url)
+					}
+				}(url)
 			}
 		}
 	}
+
+	wg.Wait()
 
 	// Вычисляем коэффициент ротации прокси
 	proxyCount, err := readProxyCount()
