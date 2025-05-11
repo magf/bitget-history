@@ -56,6 +56,7 @@ func main() {
 	timeoutFlag := flag.Int("timeout", 3, "Proxy check timeout in seconds")
 	debugFlag := flag.Bool("debug", false, "Enable debug logging")
 	skipIfExistsFlag := flag.Bool("skip-if-exists", false, "Skip downloading if file exists locally (for depth only)")
+	repeatFlag := flag.Bool("repeat", false, "Repeat process until all files are downloaded (for depth with --skip-if-exists only)")
 
 	// Короткие флаги
 	flag.BoolVar(helpFlag, "h", false, "Show help message (short)")
@@ -67,6 +68,7 @@ func main() {
 	flag.IntVar(timeoutFlag, "T", 3, "Proxy check timeout in seconds (short)")
 	flag.BoolVar(debugFlag, "d", false, "Enable debug logging (short)")
 	flag.BoolVar(skipIfExistsFlag, "S", false, "Skip downloading if file exists locally (for depth only) (short)")
+	flag.BoolVar(repeatFlag, "r", false, "Repeat process until all files are downloaded (for depth with --skip-if-exists only) (short)")
 
 	flag.Parse()
 
@@ -175,124 +177,143 @@ func main() {
 		log.Fatalf("Failed to create downloader: %v", err)
 	}
 
-	// Генерируем URL-ы
-	urls, err := generateURLs(cfg.Downloader.BaseURL, *marketFlag, *pairFlag, *typeFlag, startDate, endDate, *debugFlag, *skipIfExistsFlag, proxies, cfg.Downloader.UserAgent, outputDir)
-	if err != nil {
-		log.Fatalf("Failed to generate URLs: %v", err)
+	// Проверяем --repeat
+	if *repeatFlag && (*typeFlag != "depth" || !*skipIfExistsFlag) {
+		log.Printf("Warning: --repeat (-r) is only supported for -t depth with -S, ignoring")
+		*repeatFlag = false
 	}
 
-	// Запускаем загрузку
-	log.Println("Downloading files...")
-	if err := dl.DownloadFiles(context.Background(), urls); err != nil {
-		log.Printf("Warning: some files failed to download: %v", err)
-	}
-
-	// Группируем ZIP-файлы по типу и рынку
-	type ZipGroup struct {
-		dbPath string
-		files  []string
-	}
-	var zipGroups []ZipGroup
-
-	// Нормализуем BaseURL для TrimPrefix
-	baseURLPrefix := strings.TrimSuffix(cfg.Downloader.BaseURL, "/") + "/"
-	log.Printf("Using baseURLPrefix for trimming: %s", baseURLPrefix)
-
-	if *typeFlag == "depth" {
-		// Для depth одна база: depth/<pair>.db
-		dbPath := filepath.Join(cfg.Database.Path, "depth", *pairFlag+".db")
-		var depthFiles []string
-		for _, fileInfo := range urls {
-			relativePath := strings.TrimPrefix(fileInfo.URL, baseURLPrefix)
-			zipPath := filepath.Join(outputDir, relativePath)
-			if *debugFlag {
-				log.Printf("Processing URL: %s, relativePath: %s, zipPath: %s", fileInfo.URL, relativePath, zipPath)
-			}
-			if strings.Contains(strings.ToLower(relativePath), "depth/") {
-				depthFiles = append(depthFiles, zipPath)
-			}
+	// Основной цикл
+	for {
+		// Генерируем URL-ы
+		urls, err := generateURLs(cfg.Downloader.BaseURL, *marketFlag, *pairFlag, *typeFlag, startDate, endDate, *debugFlag, *skipIfExistsFlag, proxies, cfg.Downloader.UserAgent, outputDir)
+		if err != nil {
+			log.Fatalf("Failed to generate URLs: %v", err)
 		}
-		if len(depthFiles) > 0 {
-			sort.Strings(depthFiles)
-			log.Printf("Adding depth group: dbPath=%s, files=%v", dbPath, depthFiles)
-			zipGroups = append(zipGroups, ZipGroup{dbPath: dbPath, files: depthFiles})
-		} else {
-			log.Printf("No depth files found for %s", dbPath)
+
+		// Запускаем загрузку
+		log.Println("Downloading files...")
+		if err := dl.DownloadFiles(context.Background(), urls); err != nil {
+			log.Printf("Warning: some files failed to download: %v", err)
 		}
-	} else if *typeFlag == "trades" {
-		// Для trades две базы: trades/SPBL/<pair>.db и trades/UMCBL/<pair>.db
-		spblFiles := make([]string, 0)
-		umcblFiles := make([]string, 0)
-		for _, fileInfo := range urls {
-			relativePath := strings.TrimPrefix(fileInfo.URL, baseURLPrefix)
-			zipPath := filepath.Join(outputDir, relativePath)
-			if *debugFlag {
-				log.Printf("Processing URL: %s, relativePath: %s, zipPath: %s", fileInfo.URL, relativePath, zipPath)
-			}
-			if strings.Contains(strings.ToLower(relativePath), "trades/") {
-				if strings.Contains(relativePath, "/SPBL/") {
-					spblFiles = append(spblFiles, zipPath)
-				} else if strings.Contains(relativePath, "/UMCBL/") {
-					umcblFiles = append(umcblFiles, zipPath)
+
+		// Группируем ZIP-файлы по типу и рынку
+		type ZipGroup struct {
+			dbPath string
+			files  []string
+		}
+		var zipGroups []ZipGroup
+
+		// Нормализуем BaseURL для TrimPrefix
+		baseURLPrefix := strings.TrimSuffix(cfg.Downloader.BaseURL, "/") + "/"
+		log.Printf("Using baseURLPrefix for trimming: %s", baseURLPrefix)
+
+		if *typeFlag == "depth" {
+			// Для depth одна база: depth/<pair>.db
+			dbPath := filepath.Join(cfg.Database.Path, "depth", *pairFlag+".db")
+			var depthFiles []string
+			for _, fileInfo := range urls {
+				relativePath := strings.TrimPrefix(fileInfo.URL, baseURLPrefix)
+				zipPath := filepath.Join(outputDir, relativePath)
+				if *debugFlag {
+					log.Printf("Processing URL: %s, relativePath: %s, zipPath: %s", fileInfo.URL, relativePath, zipPath)
+				}
+				if strings.Contains(strings.ToLower(relativePath), "depth/") {
+					depthFiles = append(depthFiles, zipPath)
 				}
 			}
+			if len(depthFiles) > 0 {
+				sort.Strings(depthFiles)
+				log.Printf("Adding depth group: dbPath=%s, files=%v", dbPath, depthFiles)
+				zipGroups = append(zipGroups, ZipGroup{dbPath: dbPath, files: depthFiles})
+			} else {
+				log.Printf("No depth files found for %s", dbPath)
+			}
+		} else if *typeFlag == "trades" {
+			// Для trades две базы: trades/SPBL/<pair>.db и trades/UMCBL/<pair>.db
+			spblFiles := make([]string, 0)
+			umcblFiles := make([]string, 0)
+			for _, fileInfo := range urls {
+				relativePath := strings.TrimPrefix(fileInfo.URL, baseURLPrefix)
+				zipPath := filepath.Join(outputDir, relativePath)
+				if *debugFlag {
+					log.Printf("Processing URL: %s, relativePath: %s, zipPath: %s", fileInfo.URL, relativePath, zipPath)
+				}
+				if strings.Contains(strings.ToLower(relativePath), "trades/") {
+					if strings.Contains(relativePath, "/SPBL/") {
+						spblFiles = append(spblFiles, zipPath)
+					} else if strings.Contains(relativePath, "/UMCBL/") {
+						umcblFiles = append(umcblFiles, zipPath)
+					}
+				}
+			}
+			// Добавляем группы, если файлы есть
+			if (*marketFlag == "spot" || *marketFlag == "all") && len(spblFiles) > 0 {
+				dbPath := filepath.Join(cfg.Database.Path, "trades", "SPBL", *pairFlag+".db")
+				sort.Strings(spblFiles)
+				log.Printf("Adding SPBL group: dbPath=%s, files=%v", dbPath, spblFiles)
+				zipGroups = append(zipGroups, ZipGroup{dbPath: dbPath, files: spblFiles})
+			}
+			if (*marketFlag == "futures" || *marketFlag == "all") && len(umcblFiles) > 0 {
+				dbPath := filepath.Join(cfg.Database.Path, "trades", "UMCBL", *pairFlag+".db")
+				sort.Strings(umcblFiles)
+				log.Printf("Adding UMCBL group: dbPath=%s, files=%v", dbPath, umcblFiles)
+				zipGroups = append(zipGroups, ZipGroup{dbPath: dbPath, files: umcblFiles})
+			}
+			if len(spblFiles) == 0 && len(umcblFiles) == 0 {
+				log.Printf("No trades files found")
+			}
 		}
-		// Добавляем группы, если файлы есть
-		if (*marketFlag == "spot" || *marketFlag == "all") && len(spblFiles) > 0 {
-			dbPath := filepath.Join(cfg.Database.Path, "trades", "SPBL", *pairFlag+".db")
-			sort.Strings(spblFiles)
-			log.Printf("Adding SPBL group: dbPath=%s, files=%v", dbPath, spblFiles)
-			zipGroups = append(zipGroups, ZipGroup{dbPath: dbPath, files: spblFiles})
-		}
-		if (*marketFlag == "futures" || *marketFlag == "all") && len(umcblFiles) > 0 {
-			dbPath := filepath.Join(cfg.Database.Path, "trades", "UMCBL", *pairFlag+".db")
-			sort.Strings(umcblFiles)
-			log.Printf("Adding UMCBL group: dbPath=%s, files=%v", dbPath, umcblFiles)
-			zipGroups = append(zipGroups, ZipGroup{dbPath: dbPath, files: umcblFiles})
-		}
-		if len(spblFiles) == 0 && len(umcblFiles) == 0 {
-			log.Printf("No trades files found")
-		}
-	}
 
-	// Обрабатываем каждую группу
-	for _, group := range zipGroups {
-		log.Printf("Processing database: %s with %d zip files", group.dbPath, len(group.files))
-		// Создаём каталог для базы
-		if err := os.MkdirAll(filepath.Dir(group.dbPath), 0755); err != nil {
-			log.Printf("Failed to create directory for %s: %v", group.dbPath, err)
-			continue
+		// Обрабатываем каждую группу
+		for _, group := range zipGroups {
+			log.Printf("Processing database: %s with %d zip files", group.dbPath, len(group.files))
+			// Создаём каталог для базы
+			if err := os.MkdirAll(filepath.Dir(group.dbPath), 0755); err != nil {
+				log.Printf("Failed to create directory for %s: %v", group.dbPath, err)
+				continue
+			}
+			// Создаём DB
+			dbInstance, err := db.NewDB(group.dbPath, *typeFlag)
+			if err != nil {
+				log.Printf("Failed to create database %s: %v", group.dbPath, err)
+				continue
+			}
+			// Обрабатываем файлы
+			if err := dbInstance.ProcessZipFiles(group.files); err != nil {
+				log.Printf("Failed to process zip files for %s: %v", group.dbPath, err)
+			}
+			// Закрываем базу
+			if err := dbInstance.Close(); err != nil {
+				log.Printf("Failed to close database %s: %v", group.dbPath, err)
+			}
 		}
-		// Создаём DB
-		dbInstance, err := db.NewDB(group.dbPath, *typeFlag)
-		if err != nil {
-			log.Printf("Failed to create database %s: %v", group.dbPath, err)
-			continue
-		}
-		// Обрабатываем файлы
-		if err := dbInstance.ProcessZipFiles(group.files); err != nil {
-			log.Printf("Failed to process zip files for %s: %v", group.dbPath, err)
-		}
-		// Закрываем базу
-		if err := dbInstance.Close(); err != nil {
-			log.Printf("Failed to close database %s: %v", group.dbPath, err)
-		}
-	}
 
-	log.Println("Processing completed successfully")
-
-	// Явный чекпоинт перед завершением
-	for _, group := range zipGroups {
-		dbInstance, err := db.NewDB(group.dbPath, *typeFlag)
-		if err != nil {
-			log.Printf("Failed to reopen database %s for checkpoint: %v", group.dbPath, err)
-			continue
+		// Проверяем, нужно ли повторять
+		if !*repeatFlag || len(urls) == 0 {
+			if *repeatFlag && len(urls) == 0 {
+				log.Println("Repeat cycle completed: no URLs remaining")
+			}
+			break
 		}
-		err = dbInstance.Close()
-		if err != nil {
-			log.Printf("Failed to perform final WAL checkpoint for %s: %v", group.dbPath, err)
-		} else {
-			log.Printf("Final WAL checkpoint successful for %s", group.dbPath)
+
+		log.Printf("Repeat cycle: %d URLs remaining, continuing...", len(urls))
+
+		log.Println("Processing completed successfully")
+
+		// Явный чекпоинт перед завершением
+		for _, group := range zipGroups {
+			dbInstance, err := db.NewDB(group.dbPath, *typeFlag)
+			if err != nil {
+				log.Printf("Failed to reopen database %s for checkpoint: %v", group.dbPath, err)
+				continue
+			}
+			err = dbInstance.Close()
+			if err != nil {
+				log.Printf("Failed to perform final WAL checkpoint for %s: %v", group.dbPath, err)
+			} else {
+				log.Printf("Final WAL checkpoint successful for %s", group.dbPath)
+			}
 		}
 	}
 }
@@ -529,13 +550,14 @@ func printHelp() {
 	fmt.Println("Bitget History Downloader")
 	fmt.Println("Usage: bitget-history [options]")
 	fmt.Println("Options:")
-	fmt.Println("  --help, -h          	Show this help message")
-	fmt.Println("  --pair, -p string   	Trading pair (e.g., BTCUSDT) (default: BTCUSDT)")
-	fmt.Println("  --type, -t string   	Data type: trades or depth (required)")
-	fmt.Println("  --market, -m string 	Market type: spot, futures or all (default: all)")
-	fmt.Println("  --start, -s string  	Start date (YYYY-MM-DD, default: 1 year ago)")
-	fmt.Println("  --end, -e string    	End date (YYYY-MM-DD, default: today)")
-	fmt.Println("  --timeout, -T int   	Proxy check timeout in seconds (default: 3)")
-	fmt.Println("  --debug, -d         	Enable debug logging")
-	fmt.Println("  --skip-if-exists, -S Skip downloading if file exists locally (for depth only)")
+	fmt.Println("  --help, -h          Show this help message")
+	fmt.Println("  --pair, -p string   Trading pair (e.g., BTCUSDT) (default: BTCUSDT)")
+	fmt.Println("  --type, -t string   Data type: trades or depth (required)")
+	fmt.Println("  --market, -m string Market type: spot, futures or all (default: all)")
+	fmt.Println("  --start, -s string  Start date (YYYY-MM-DD, default: 1 year ago)")
+	fmt.Println("  --end, -e string    End date (YYYY-MM-DD, default: today)")
+	fmt.Println("  --timeout, -T int   Proxy check timeout in seconds (default: 3)")
+	fmt.Println("  --debug, -d         Enable debug logging")
+	fmt.Println("  --skip-if-exists, -S  Skip downloading if file exists locally (for depth only)")
+	fmt.Println("  --repeat, -r        Repeat process until all files are downloaded (for depth with --skip-if-exists only)")
 }
