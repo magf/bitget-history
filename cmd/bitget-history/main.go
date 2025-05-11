@@ -49,7 +49,7 @@ func main() {
 	helpFlag := flag.Bool("help", false, "Show help message")
 	pairFlag := flag.String("pair", "BTCUSDT", "Trading pair (e.g., BTCUSDT)")
 	typeFlag := flag.String("type", "", "Data type: trades or depth")
-	marketFlag := flag.String("market", "spot", "Market type: spot or futures")
+	marketFlag := flag.String("market", "all", "Market type: spot, futures or all")
 	startFlag := flag.String("start", "", "Start date (YYYY-MM-DD, default: 1 year ago)")
 	endFlag := flag.String("end", "", "End date (YYYY-MM-DD, default: today)")
 	timeoutFlag := flag.Int("timeout", 3, "Proxy check timeout in seconds")
@@ -59,7 +59,7 @@ func main() {
 	flag.BoolVar(helpFlag, "h", false, "Show help message (short)")
 	flag.StringVar(pairFlag, "p", "BTCUSDT", "Trading pair (short)")
 	flag.StringVar(typeFlag, "t", "", "Data type (short)")
-	flag.StringVar(marketFlag, "m", "spot", "Market type (short)")
+	flag.StringVar(marketFlag, "m", "all", "Market type (short)")
 	flag.StringVar(startFlag, "s", "", "Start date (short)")
 	flag.StringVar(endFlag, "e", "", "End date (short)")
 	flag.IntVar(timeoutFlag, "T", 3, "Proxy check timeout in seconds (short)")
@@ -82,8 +82,12 @@ func main() {
 	}
 
 	// Проверяем market
-	if *marketFlag != "spot" && *marketFlag != "futures" {
-		log.Fatalf("Error: invalid --market value: %s (must be spot or futures)", *marketFlag)
+	if *marketFlag != "spot" && *marketFlag != "futures" && *marketFlag != "all" {
+		log.Fatalf("Error: invalid --market value: %s (must be spot, futures or all)", *marketFlag)
+	}
+	// Для trades значение all недопустимо
+	if *typeFlag == "trades" && *marketFlag == "all" {
+		log.Fatal("Error: --market all is not supported for trades (use spot or futures)")
 	}
 
 	// Устанавливаем даты
@@ -273,7 +277,13 @@ func generateURLs(baseURL, market, pair, dataType string, startDate, endDate tim
 			}
 		}
 	} else { // depth
-		marketCodes := []string{"1", "2"} // Проверяем оба кода
+		// Выбираем marketCodes в зависимости от --market
+		marketCodes := []string{"1"} // spot по умолчанию
+		if market == "futures" {
+			marketCodes = []string{"2"}
+		} else if market == "all" {
+			marketCodes = []string{"1", "2"}
+		}
 		for _, marketCode := range marketCodes {
 			for d := startDate; !d.After(endDate); d = d.AddDate(0, 0, 1) {
 				path := fmt.Sprintf("depth/%s/%s/%s.zip", pair, marketCode, d.Format("20060102"))
@@ -421,7 +431,7 @@ func printHelp() {
 	fmt.Println("  --help, -h          Show this help message")
 	fmt.Println("  --pair, -p string   Trading pair (e.g., BTCUSDT) (default: BTCUSDT)")
 	fmt.Println("  --type, -t string   Data type: trades or depth (required)")
-	fmt.Println("  --market, -m string Market type: spot or futures (default: spot)")
+	fmt.Println("  --market, -m string Market type: spot, futures or all (default: all)")
 	fmt.Println("  --start, -s string  Start date (YYYY-MM-DD, default: 1 year ago)")
 	fmt.Println("  --end, -e string    End date (YYYY-MM-DD, default: today)")
 	fmt.Println("  --timeout, -T int   Proxy check timeout in seconds (default: 3)")
