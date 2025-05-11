@@ -55,6 +55,7 @@ func main() {
 	endFlag := flag.String("end", "", "End date (YYYY-MM-DD, default: today)")
 	timeoutFlag := flag.Int("timeout", 3, "Proxy check timeout in seconds")
 	debugFlag := flag.Bool("debug", false, "Enable debug logging")
+	skipIfExistsFlag := flag.Bool("skip-if-exists", false, "Skip downloading if file exists locally (for depth only)")
 
 	// Короткие флаги
 	flag.BoolVar(helpFlag, "h", false, "Show help message (short)")
@@ -65,6 +66,7 @@ func main() {
 	flag.StringVar(endFlag, "e", "", "End date (short)")
 	flag.IntVar(timeoutFlag, "T", 3, "Proxy check timeout in seconds (short)")
 	flag.BoolVar(debugFlag, "d", false, "Enable debug logging (short)")
+	flag.BoolVar(skipIfExistsFlag, "S", false, "Skip downloading if file exists locally (for depth only) (short)")
 
 	flag.Parse()
 
@@ -174,7 +176,7 @@ func main() {
 	}
 
 	// Генерируем URL-ы
-	urls, err := generateURLs(cfg.Downloader.BaseURL, *marketFlag, *pairFlag, *typeFlag, startDate, endDate, *debugFlag, proxies, cfg.Downloader.UserAgent)
+	urls, err := generateURLs(cfg.Downloader.BaseURL, *marketFlag, *pairFlag, *typeFlag, startDate, endDate, *debugFlag, *skipIfExistsFlag, proxies, cfg.Downloader.UserAgent, outputDir)
 	if err != nil {
 		log.Fatalf("Failed to generate URLs: %v", err)
 	}
@@ -182,7 +184,7 @@ func main() {
 	// Запускаем загрузку
 	log.Println("Downloading files...")
 	if err := dl.DownloadFiles(context.Background(), urls); err != nil {
-		log.Fatalf("Failed to download files: %v", err)
+		log.Printf("Warning: some files failed to download: %v", err)
 	}
 
 	// Группируем ZIP-файлы по типу и рынку
@@ -296,7 +298,7 @@ func main() {
 }
 
 // generateURLs генерирует список URL-ов на основе параметров.
-func generateURLs(baseURL, market, pair, dataType string, startDate, endDate time.Time, debug bool, proxies []string, userAgent string) ([]downloader.FileInfo, error) {
+func generateURLs(baseURL, market, pair, dataType string, startDate, endDate time.Time, debug, skipIfExists bool, proxies []string, userAgent, outputDir string) ([]downloader.FileInfo, error) {
 	var urls []downloader.FileInfo
 	days := int(endDate.Sub(startDate).Hours()/24) + 1
 	var mu sync.Mutex
@@ -340,7 +342,7 @@ func generateURLs(baseURL, market, pair, dataType string, startDate, endDate tim
 							}
 							if !exists {
 								if debug {
-									log.Printf("Stopping at %s: file does not exist", url)
+									log.Printf("Skipping %s: file does not exist", url)
 								}
 								mu.Lock()
 								stopBatch = true
@@ -376,8 +378,20 @@ func generateURLs(baseURL, market, pair, dataType string, startDate, endDate tim
 				url := fmt.Sprintf("%s/%s", baseURL, path)
 
 				wg.Add(1)
-				go func(url string) {
+				go func(url, path string) {
 					defer wg.Done()
+
+					// Проверяем, существует ли файл локально, если установлен --skip-if-exists
+					if skipIfExists {
+						localPath := filepath.Join(outputDir, path)
+						if _, err := os.Stat(localPath); err == nil {
+							if debug {
+								log.Printf("Skipping %s: file already exists locally", url)
+							}
+							return
+						}
+					}
+
 					exists, contentLength, err := checkFileExists(url, proxies, userAgent, debug)
 					if err != nil {
 						if debug {
@@ -397,7 +411,7 @@ func generateURLs(baseURL, market, pair, dataType string, startDate, endDate tim
 						log.Printf("Generated URL: %s (Content-Length: %d)", url, contentLength)
 					}
 					mu.Unlock()
-				}(url)
+				}(url, path)
 			}
 		}
 	}
@@ -515,12 +529,13 @@ func printHelp() {
 	fmt.Println("Bitget History Downloader")
 	fmt.Println("Usage: bitget-history [options]")
 	fmt.Println("Options:")
-	fmt.Println("  --help, -h          Show this help message")
-	fmt.Println("  --pair, -p string   Trading pair (e.g., BTCUSDT) (default: BTCUSDT)")
-	fmt.Println("  --type, -t string   Data type: trades or depth (required)")
-	fmt.Println("  --market, -m string Market type: spot, futures or all (default: all)")
-	fmt.Println("  --start, -s string  Start date (YYYY-MM-DD, default: 1 year ago)")
-	fmt.Println("  --end, -e string    End date (YYYY-MM-DD, default: today)")
-	fmt.Println("  --timeout, -T int   Proxy check timeout in seconds (default: 3)")
-	fmt.Println("  --debug, -d         Enable debug logging")
+	fmt.Println("  --help, -h          	Show this help message")
+	fmt.Println("  --pair, -p string   	Trading pair (e.g., BTCUSDT) (default: BTCUSDT)")
+	fmt.Println("  --type, -t string   	Data type: trades or depth (required)")
+	fmt.Println("  --market, -m string 	Market type: spot, futures or all (default: all)")
+	fmt.Println("  --start, -s string  	Start date (YYYY-MM-DD, default: 1 year ago)")
+	fmt.Println("  --end, -e string    	End date (YYYY-MM-DD, default: today)")
+	fmt.Println("  --timeout, -T int   	Proxy check timeout in seconds (default: 3)")
+	fmt.Println("  --debug, -d         	Enable debug logging")
+	fmt.Println("  --skip-if-exists, -S Skip downloading if file exists locally (for depth only)")
 }
