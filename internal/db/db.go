@@ -61,7 +61,8 @@ func NewDB(dbPath string) (*DB, error) {
 	// Создаём таблицу depth_1
 	_, err = conn.Exec(`
 		CREATE TABLE IF NOT EXISTS depth_1 (
-			timestamp INTEGER PRIMARY KEY,
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			timestamp INTEGER,
 			ask_price REAL,
 			bid_price REAL,
 			ask_volume REAL,
@@ -77,7 +78,8 @@ func NewDB(dbPath string) (*DB, error) {
 	// Создаём таблицу depth_2
 	_, err = conn.Exec(`
 		CREATE TABLE IF NOT EXISTS depth_2 (
-			timestamp INTEGER PRIMARY KEY,
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			timestamp INTEGER,
 			ask_price REAL,
 			bid_price REAL,
 			ask_volume REAL,
@@ -118,9 +120,19 @@ func NewDB(dbPath string) (*DB, error) {
 // Close закрывает подключение к базе и синкает WAL.
 func (db *DB) Close() error {
 	log.Printf("Closing database: %s", db.path)
-	err := db.conn.Close()
-	if err != nil {
-		return fmt.Errorf("failed to close database %s: %w", db.path, err)
+	if db.conn != nil {
+		// Выполняем чекпоинт WAL
+		_, err := db.conn.Exec("PRAGMA wal_checkpoint(FULL);")
+		if err != nil {
+			log.Printf("Failed to perform WAL checkpoint for %s: %v", db.path, err)
+		} else {
+			log.Printf("WAL checkpoint successful for %s", db.path)
+		}
+		err = db.conn.Close()
+		db.conn = nil
+		if err != nil {
+			return fmt.Errorf("failed to close database %s: %w", db.path, err)
+		}
 	}
 	log.Printf("Database %s closed successfully", db.path)
 	return nil
@@ -136,6 +148,66 @@ func (db *DB) ProcessZipFiles(zipFiles []string) error {
 	}
 	if err := os.MkdirAll(tmpDir, 0755); err != nil {
 		return fmt.Errorf("failed to create %s: %w", tmpDir, err)
+	}
+
+	// Дропаем таблицы depth перед обработкой
+	isDepth := false
+	for _, zipPath := range zipFiles {
+		if strings.Contains(strings.ToLower(zipPath), "/depth/") {
+			isDepth = true
+			break
+		}
+	}
+	if isDepth {
+		log.Printf("Dropping depth tables in %s", db.path)
+		_, err := db.conn.Exec("DROP TABLE IF EXISTS depth_1")
+		if err != nil {
+			return fmt.Errorf("failed to drop depth_1 table in %s: %w", db.path, err)
+		}
+		_, err = db.conn.Exec("DROP TABLE IF EXISTS depth_2")
+		if err != nil {
+			return fmt.Errorf("failed to drop depth_2 table in %s: %w", db.path, err)
+		}
+		// Пересоздаём таблицы depth
+		_, err = db.conn.Exec(`
+			CREATE TABLE depth_1 (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				timestamp INTEGER,
+				ask_price REAL,
+				bid_price REAL,
+				ask_volume REAL,
+				bid_volume REAL
+			)
+		`)
+		if err != nil {
+			return fmt.Errorf("failed to recreate depth_1 table in %s: %w", db.path, err)
+		}
+		log.Printf("Recreated depth_1 table in %s", db.path)
+		_, err = db.conn.Exec(`
+			CREATE TABLE depth_2 (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				timestamp INTEGER,
+				ask_price REAL,
+				bid_price REAL,
+				ask_volume REAL,
+				bid_volume REAL
+			)
+		`)
+		if err != nil {
+			return fmt.Errorf("failed to recreate depth_2 table in %s: %w", db.path, err)
+		}
+		log.Printf("Recreated depth_2 table in %s", db.path)
+		// Пересоздаём индексы
+		_, err = db.conn.Exec("CREATE INDEX idx_depth_1_timestamp ON depth_1(timestamp)")
+		if err != nil {
+			return fmt.Errorf("failed to recreate index idx_depth_1_timestamp in %s: %w", db.path, err)
+		}
+		log.Printf("Recreated index idx_depth_1_timestamp in %s", db.path)
+		_, err = db.conn.Exec("CREATE INDEX idx_depth_2_timestamp ON depth_2(timestamp)")
+		if err != nil {
+			return fmt.Errorf("failed to recreate index idx_depth_2_timestamp in %s: %w", db.path, err)
+		}
+		log.Printf("Recreated index idx_depth_2_timestamp in %s", db.path)
 	}
 
 	for _, zipPath := range zipFiles {
@@ -362,18 +434,21 @@ func (db *DB) processTradesCSV(zipPath, csvPath string) error {
 	defer stmt.Close()
 
 	inserted := 0
+	skipped := 0
 	for i, record := range records {
 		if i == 0 {
 			continue // Пропускаем заголовок
 		}
 		if len(record) < 6 {
 			log.Printf("Skipping invalid record in %s at line %d: %v", zipPath, i+1, record)
+			skipped++
 			continue
 		}
 
 		tradeID := strings.TrimSpace(record[0])
 		if tradeID == "" {
 			log.Printf("Skipping record in %s at line %d: empty trade_id", zipPath, i+1)
+			skipped++
 			continue
 		}
 
@@ -381,6 +456,7 @@ func (db *DB) processTradesCSV(zipPath, csvPath string) error {
 		timestamp, err := strconv.ParseInt(timestampStr, 10, 64)
 		if err != nil {
 			log.Printf("Skipping record in %s at line %d: invalid timestamp %s", zipPath, i+1, timestampStr)
+			skipped++
 			continue
 		}
 
@@ -388,12 +464,14 @@ func (db *DB) processTradesCSV(zipPath, csvPath string) error {
 		price, err := strconv.ParseFloat(priceStr, 64)
 		if err != nil {
 			log.Printf("Skipping record in %s at line %d: invalid price %s", zipPath, i+1, priceStr)
+			skipped++
 			continue
 		}
 
 		side := strings.TrimSpace(record[3])
 		if side != "buy" && side != "sell" {
 			log.Printf("Skipping record in %s at line %d: invalid side %s", zipPath, i+1, side)
+			skipped++
 			continue
 		}
 
@@ -401,6 +479,7 @@ func (db *DB) processTradesCSV(zipPath, csvPath string) error {
 		volumeQuote, err := strconv.ParseFloat(volumeQuoteStr, 64)
 		if err != nil {
 			log.Printf("Skipping record in %s at line %d: invalid volume_quote %s", zipPath, i+1, volumeQuoteStr)
+			skipped++
 			continue
 		}
 
@@ -408,17 +487,21 @@ func (db *DB) processTradesCSV(zipPath, csvPath string) error {
 		sizeBase, err := strconv.ParseFloat(sizeBaseStr, 64)
 		if err != nil {
 			log.Printf("Skipping record in %s at line %d: invalid size_base %s", zipPath, i+1, sizeBaseStr)
+			skipped++
 			continue
 		}
 
 		result, err := stmt.Exec(tradeID, timestamp, price, side, volumeQuote, sizeBase)
 		if err != nil {
 			log.Printf("Failed to insert record in %s at line %d: %v", zipPath, i+1, err)
+			skipped++
 			continue
 		}
 		affected, _ := result.RowsAffected()
 		if affected > 0 {
 			inserted++
+		} else {
+			skipped++
 		}
 	}
 
@@ -426,7 +509,7 @@ func (db *DB) processTradesCSV(zipPath, csvPath string) error {
 		tx.Rollback()
 		return fmt.Errorf("failed to commit transaction in %s: %w", db.path, err)
 	}
-	log.Printf("Committed transaction for trades CSV %s in %s, inserted %d rows", csvPath, db.path, inserted)
+	log.Printf("Committed transaction for trades CSV %s in %s, inserted %d rows, skipped %d rows", csvPath, db.path, inserted, skipped)
 
 	// Выполняем чекпоинт WAL
 	_, err = db.conn.Exec("PRAGMA wal_checkpoint(TRUNCATE);")
@@ -460,7 +543,7 @@ func (db *DB) processDepthCSV(zipPath, csvPath, tableName string) error {
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction in %s: %w", db.path, err)
 	}
-	stmt, err := tx.Prepare(fmt.Sprintf("INSERT OR IGNORE INTO %s (timestamp, ask_price, bid_price, ask_volume, bid_volume) VALUES (?, ?, ?, ?, ?)", tableName))
+	stmt, err := tx.Prepare(fmt.Sprintf("INSERT INTO %s (timestamp, ask_price, bid_price, ask_volume, bid_volume) VALUES (?, ?, ?, ?, ?)", tableName))
 	if err != nil {
 		tx.Rollback()
 		return fmt.Errorf("failed to prepare statement for table %s in %s: %w", tableName, db.path, err)
@@ -468,6 +551,7 @@ func (db *DB) processDepthCSV(zipPath, csvPath, tableName string) error {
 	defer stmt.Close()
 
 	inserted := 0
+	skipped := 0
 	for i, record := range records {
 		if i == 0 {
 			continue // Пропускаем заголовок
@@ -481,6 +565,7 @@ func (db *DB) processDepthCSV(zipPath, csvPath, tableName string) error {
 		timestamp, err := strconv.ParseInt(timestampStr, 10, 64)
 		if err != nil {
 			log.Printf("Skipping record in %s at line %d: invalid timestamp %s: %v", zipPath, i+1, timestampStr, record)
+			skipped++
 			continue
 		}
 
@@ -488,6 +573,7 @@ func (db *DB) processDepthCSV(zipPath, csvPath, tableName string) error {
 		askPrice, err := strconv.ParseFloat(askPriceStr, 64)
 		if err != nil {
 			log.Printf("Skipping record in %s at line %d: invalid ask_price %s: %v", zipPath, i+1, askPriceStr, record)
+			skipped++
 			continue
 		}
 
@@ -495,6 +581,7 @@ func (db *DB) processDepthCSV(zipPath, csvPath, tableName string) error {
 		bidPrice, err := strconv.ParseFloat(bidPriceStr, 64)
 		if err != nil {
 			log.Printf("Skipping record in %s at line %d: invalid bid_price %s: %v", zipPath, i+1, bidPriceStr, record)
+			skipped++
 			continue
 		}
 
@@ -502,6 +589,7 @@ func (db *DB) processDepthCSV(zipPath, csvPath, tableName string) error {
 		askVolume, err := strconv.ParseFloat(askVolumeStr, 64)
 		if err != nil {
 			log.Printf("Skipping record in %s at line %d: invalid ask_volume %s: %v", zipPath, i+1, askVolumeStr, record)
+			skipped++
 			continue
 		}
 
@@ -509,17 +597,21 @@ func (db *DB) processDepthCSV(zipPath, csvPath, tableName string) error {
 		bidVolume, err := strconv.ParseFloat(bidVolumeStr, 64)
 		if err != nil {
 			log.Printf("Skipping record in %s at line %d: invalid bid_volume %s: %v", zipPath, i+1, bidVolumeStr, record)
+			skipped++
 			continue
 		}
 
 		result, err := stmt.Exec(timestamp, askPrice, bidPrice, askVolume, bidVolume)
 		if err != nil {
 			log.Printf("Failed to insert record in %s at line %d: %v", zipPath, i+1, err)
+			skipped++
 			continue
 		}
 		affected, _ := result.RowsAffected()
 		if affected > 0 {
 			inserted++
+		} else {
+			skipped++
 		}
 	}
 
@@ -527,7 +619,7 @@ func (db *DB) processDepthCSV(zipPath, csvPath, tableName string) error {
 		tx.Rollback()
 		return fmt.Errorf("failed to commit transaction for table %s in %s: %w", tableName, db.path, err)
 	}
-	log.Printf("Committed transaction for depth CSV %s in %s (table %s), inserted %d rows", csvPath, db.path, tableName, inserted)
+	log.Printf("Committed transaction for depth CSV %s in %s (table %s), inserted %d rows, skipped %d rows", csvPath, db.path, tableName, inserted, skipped)
 
 	// Выполняем чекпоинт WAL
 	_, err = db.conn.Exec("PRAGMA wal_checkpoint(TRUNCATE);")

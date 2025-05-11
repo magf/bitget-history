@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort" // Добавлено для сортировки
 	"strconv"
 	"strings"
 	"sync"
@@ -84,10 +85,6 @@ func main() {
 	// Проверяем market
 	if *marketFlag != "spot" && *marketFlag != "futures" && *marketFlag != "all" {
 		log.Fatalf("Error: invalid --market value: %s (must be spot, futures or all)", *marketFlag)
-	}
-	// Для trades значение all недопустимо
-	if *typeFlag == "trades" && *marketFlag == "all" {
-		log.Fatal("Error: --market all is not supported for trades (use spot or futures)")
 	}
 
 	// Устанавливаем даты
@@ -208,6 +205,10 @@ func main() {
 		zipFiles = append(zipFiles, zipPath)
 	}
 
+	// Сортируем zipFiles по алфавиту для строгого порядка обработки
+	sort.Strings(zipFiles)
+	log.Printf("Sorted %d zip files for processing", len(zipFiles))
+
 	// Обрабатываем Zip-файлы и выгружаем в базу
 	log.Println("Processing and uploading files to database...")
 	if err := dbInstance.ProcessZipFiles(zipFiles); err != nil {
@@ -234,58 +235,62 @@ func generateURLs(baseURL, market, pair, dataType string, startDate, endDate tim
 	var wg sync.WaitGroup
 
 	if dataType == "trades" {
-		marketCode := "SPBL"
+		marketCodes := []string{"SPBL"} // spot по умолчанию
 		if market == "futures" {
-			marketCode = "UMCBL"
+			marketCodes = []string{"UMCBL"}
+		} else if market == "all" {
+			marketCodes = []string{"SPBL", "UMCBL"} // Поддержка all
 		}
-		for d := startDate; !d.After(endDate); d = d.AddDate(0, 0, 1) {
-			dateStr := d.Format("20060102")
-			// Проверяем файлы пачками по 10
-			for startNum := 1; startNum <= 999; startNum += 10 {
-				endNum := startNum + 9
-				if endNum > 999 {
-					endNum = 999
-				}
-				batchURLs := make([]string, 0, endNum-startNum+1)
-				for num := startNum; num <= endNum; num++ {
-					path := fmt.Sprintf("trades/%s/%s/%s_%03d.zip", marketCode, pair, dateStr, num)
-					url := fmt.Sprintf("%s/%s", baseURL, path)
-					batchURLs = append(batchURLs, url)
-				}
+		for _, marketCode := range marketCodes {
+			for d := startDate; !d.After(endDate); d = d.AddDate(0, 0, 1) {
+				dateStr := d.Format("20060102")
+				// Проверяем файлы пачками по 10
+				for startNum := 1; startNum <= 999; startNum += 10 {
+					endNum := startNum + 9
+					if endNum > 999 {
+						endNum = 999
+					}
+					batchURLs := make([]string, 0, endNum-startNum+1)
+					for num := startNum; num <= endNum; num++ {
+						path := fmt.Sprintf("trades/%s/%s/%s_%03d.zip", marketCode, pair, dateStr, num)
+						url := fmt.Sprintf("%s/%s", baseURL, path)
+						batchURLs = append(batchURLs, url)
+					}
 
-				// Параллельная проверка пачки
-				stopBatch := false
-				for _, url := range batchURLs {
-					wg.Add(1)
-					go func(url string) {
-						defer wg.Done()
-						exists, contentLength, err := checkFileExists(url, proxies, userAgent, debug)
-						if err != nil {
-							if debug {
-								log.Printf("Error checking %s: %v", url, err)
+					// Параллельная проверка пачки
+					stopBatch := false
+					for _, url := range batchURLs {
+						wg.Add(1)
+						go func(url string) {
+							defer wg.Done()
+							exists, contentLength, err := checkFileExists(url, proxies, userAgent, debug)
+							if err != nil {
+								if debug {
+									log.Printf("Error checking %s: %v", url, err)
+								}
+								return
 							}
-							return
-						}
-						if !exists {
-							if debug {
-								log.Printf("Stopping at %s: file does not exist", url)
+							if !exists {
+								if debug {
+									log.Printf("Stopping at %s: file does not exist", url)
+								}
+								mu.Lock()
+								stopBatch = true
+								mu.Unlock()
+								return
 							}
 							mu.Lock()
-							stopBatch = true
+							urls = append(urls, downloader.FileInfo{URL: url, ContentLength: contentLength})
 							mu.Unlock()
-							return
-						}
-						mu.Lock()
-						urls = append(urls, downloader.FileInfo{URL: url, ContentLength: contentLength})
-						mu.Unlock()
-						if debug {
-							log.Printf("Generated URL: %s (Content-Length: %d)", url, contentLength)
-						}
-					}(url)
-				}
-				wg.Wait()
-				if stopBatch {
-					break // Прерываем цикл для этой даты
+							if debug {
+								log.Printf("Generated URL: %s (Content-Length: %d)", url, contentLength)
+							}
+						}(url)
+					}
+					wg.Wait()
+					if stopBatch {
+						break // Прерываем цикл для этой даты
+					}
 				}
 			}
 		}
