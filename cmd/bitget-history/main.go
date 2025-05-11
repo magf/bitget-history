@@ -12,7 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"sort" // Добавлено для сортировки
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -144,7 +144,7 @@ func main() {
 	if cfg.Database.Path == "" || strings.Contains(cfg.Database.Path, "%s") {
 		log.Fatalf("Error: invalid database path in config: %s", cfg.Database.Path)
 	}
-	log.Printf("Using database path from config: %s", cfg.Database.Path)
+	log.Printf("Using database root path from config: %s", cfg.Database.Path)
 
 	// Создаём ProxyManager
 	timeout := time.Duration(*timeoutFlag) * time.Second
@@ -185,45 +185,113 @@ func main() {
 		log.Fatalf("Failed to download files: %v", err)
 	}
 
-	// Создаём DB
-	dbInstance, err := db.NewDB(cfg.Database.Path)
-	if err != nil {
-		log.Fatalf("Failed to create database: %v", err)
+	// Группируем ZIP-файлы по типу и рынку
+	type ZipGroup struct {
+		dbPath string
+		files  []string
 	}
-	defer func() {
-		log.Printf("Ensuring database close for %s", cfg.Database.Path)
-		if err := dbInstance.Close(); err != nil {
-			log.Printf("Failed to close database: %v", err)
+	var zipGroups []ZipGroup
+
+	// Нормализуем BaseURL для TrimPrefix
+	baseURLPrefix := strings.TrimSuffix(cfg.Downloader.BaseURL, "/") + "/"
+	log.Printf("Using baseURLPrefix for trimming: %s", baseURLPrefix)
+
+	if *typeFlag == "depth" {
+		// Для depth одна база: depth/<pair>.db
+		dbPath := filepath.Join(cfg.Database.Path, "depth", *pairFlag+".db")
+		var depthFiles []string
+		for _, fileInfo := range urls {
+			relativePath := strings.TrimPrefix(fileInfo.URL, baseURLPrefix)
+			zipPath := filepath.Join(outputDir, relativePath)
+			if *debugFlag {
+				log.Printf("Processing URL: %s, relativePath: %s, zipPath: %s", fileInfo.URL, relativePath, zipPath)
+			}
+			if strings.Contains(strings.ToLower(relativePath), "depth/") {
+				depthFiles = append(depthFiles, zipPath)
+			}
 		}
-	}()
-
-	// Собираем пути к Zip-файлам
-	var zipFiles []string
-	for _, fileInfo := range urls {
-		relativePath := strings.TrimPrefix(fileInfo.URL, cfg.Downloader.BaseURL+"/")
-		zipPath := filepath.Join(outputDir, relativePath)
-		zipFiles = append(zipFiles, zipPath)
+		if len(depthFiles) > 0 {
+			sort.Strings(depthFiles)
+			log.Printf("Adding depth group: dbPath=%s, files=%v", dbPath, depthFiles)
+			zipGroups = append(zipGroups, ZipGroup{dbPath: dbPath, files: depthFiles})
+		} else {
+			log.Printf("No depth files found for %s", dbPath)
+		}
+	} else if *typeFlag == "trades" {
+		// Для trades две базы: trades/SPBL/<pair>.db и trades/UMCBL/<pair>.db
+		spblFiles := make([]string, 0)
+		umcblFiles := make([]string, 0)
+		for _, fileInfo := range urls {
+			relativePath := strings.TrimPrefix(fileInfo.URL, baseURLPrefix)
+			zipPath := filepath.Join(outputDir, relativePath)
+			if *debugFlag {
+				log.Printf("Processing URL: %s, relativePath: %s, zipPath: %s", fileInfo.URL, relativePath, zipPath)
+			}
+			if strings.Contains(strings.ToLower(relativePath), "trades/") {
+				if strings.Contains(relativePath, "/SPBL/") {
+					spblFiles = append(spblFiles, zipPath)
+				} else if strings.Contains(relativePath, "/UMCBL/") {
+					umcblFiles = append(umcblFiles, zipPath)
+				}
+			}
+		}
+		// Добавляем группы, если файлы есть
+		if (*marketFlag == "spot" || *marketFlag == "all") && len(spblFiles) > 0 {
+			dbPath := filepath.Join(cfg.Database.Path, "trades", "SPBL", *pairFlag+".db")
+			sort.Strings(spblFiles)
+			log.Printf("Adding SPBL group: dbPath=%s, files=%v", dbPath, spblFiles)
+			zipGroups = append(zipGroups, ZipGroup{dbPath: dbPath, files: spblFiles})
+		}
+		if (*marketFlag == "futures" || *marketFlag == "all") && len(umcblFiles) > 0 {
+			dbPath := filepath.Join(cfg.Database.Path, "trades", "UMCBL", *pairFlag+".db")
+			sort.Strings(umcblFiles)
+			log.Printf("Adding UMCBL group: dbPath=%s, files=%v", dbPath, umcblFiles)
+			zipGroups = append(zipGroups, ZipGroup{dbPath: dbPath, files: umcblFiles})
+		}
+		if len(spblFiles) == 0 && len(umcblFiles) == 0 {
+			log.Printf("No trades files found")
+		}
 	}
 
-	// Сортируем zipFiles по алфавиту для строгого порядка обработки
-	sort.Strings(zipFiles)
-	log.Printf("Sorted %d zip files for processing", len(zipFiles))
-
-	// Обрабатываем Zip-файлы и выгружаем в базу
-	log.Println("Processing and uploading files to database...")
-	if err := dbInstance.ProcessZipFiles(zipFiles); err != nil {
-		log.Printf("Failed to process zip files: %v", err)
-		return
+	// Обрабатываем каждую группу
+	for _, group := range zipGroups {
+		log.Printf("Processing database: %s with %d zip files", group.dbPath, len(group.files))
+		// Создаём каталог для базы
+		if err := os.MkdirAll(filepath.Dir(group.dbPath), 0755); err != nil {
+			log.Printf("Failed to create directory for %s: %v", group.dbPath, err)
+			continue
+		}
+		// Создаём DB
+		dbInstance, err := db.NewDB(group.dbPath, *typeFlag)
+		if err != nil {
+			log.Printf("Failed to create database %s: %v", group.dbPath, err)
+			continue
+		}
+		// Обрабатываем файлы
+		if err := dbInstance.ProcessZipFiles(group.files); err != nil {
+			log.Printf("Failed to process zip files for %s: %v", group.dbPath, err)
+		}
+		// Закрываем базу
+		if err := dbInstance.Close(); err != nil {
+			log.Printf("Failed to close database %s: %v", group.dbPath, err)
+		}
 	}
 
 	log.Println("Processing completed successfully")
 
 	// Явный чекпоинт перед завершением
-	err = dbInstance.Close()
-	if err != nil {
-		log.Printf("Failed to perform final WAL checkpoint: %v", err)
-	} else {
-		log.Printf("Final WAL checkpoint successful")
+	for _, group := range zipGroups {
+		dbInstance, err := db.NewDB(group.dbPath, *typeFlag)
+		if err != nil {
+			log.Printf("Failed to reopen database %s for checkpoint: %v", group.dbPath, err)
+			continue
+		}
+		err = dbInstance.Close()
+		if err != nil {
+			log.Printf("Failed to perform final WAL checkpoint for %s: %v", group.dbPath, err)
+		} else {
+			log.Printf("Final WAL checkpoint successful for %s", group.dbPath)
+		}
 	}
 }
 
@@ -281,10 +349,10 @@ func generateURLs(baseURL, market, pair, dataType string, startDate, endDate tim
 							}
 							mu.Lock()
 							urls = append(urls, downloader.FileInfo{URL: url, ContentLength: contentLength})
-							mu.Unlock()
 							if debug {
 								log.Printf("Generated URL: %s (Content-Length: %d)", url, contentLength)
 							}
+							mu.Unlock()
 						}(url)
 					}
 					wg.Wait()
@@ -325,10 +393,10 @@ func generateURLs(baseURL, market, pair, dataType string, startDate, endDate tim
 					}
 					mu.Lock()
 					urls = append(urls, downloader.FileInfo{URL: url, ContentLength: contentLength})
-					mu.Unlock()
 					if debug {
 						log.Printf("Generated URL: %s (Content-Length: %d)", url, contentLength)
 					}
+					mu.Unlock()
 				}(url)
 			}
 		}
@@ -344,6 +412,7 @@ func generateURLs(baseURL, market, pair, dataType string, startDate, endDate tim
 	rotationFactor := int(math.Ceil(float64(days) / float64(proxyCount)))
 	if debug {
 		log.Printf("Days: %d, Proxies: %d, Rotation factor: %d", days, proxyCount, rotationFactor)
+		log.Printf("Generated %d URLs: %v", len(urls), urls)
 	}
 
 	return urls, nil

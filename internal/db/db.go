@@ -18,17 +18,21 @@ import (
 
 // DB управляет подключением к SQLite и выгрузкой данных.
 type DB struct {
-	conn *sql.DB
-	path string // Для логирования
+	conn     *sql.DB
+	path     string // Для логирования
+	dataType string // trades или depth
 }
 
 // NewDB создаёт новое подключение к SQLite и инициализирует схему.
-func NewDB(dbPath string) (*DB, error) {
+func NewDB(dbPath, dataType string) (*DB, error) {
 	// Проверяем, что путь не содержит шаблонов
 	if strings.Contains(dbPath, "%s") {
 		return nil, fmt.Errorf("invalid database path: %s contains placeholder %%s", dbPath)
 	}
-	log.Printf("Opening database: %s", dbPath)
+	if dataType != "trades" && dataType != "depth" {
+		return nil, fmt.Errorf("invalid data type: %s (must be trades or depth)", dataType)
+	}
+	log.Printf("Opening database: %s for %s", dbPath, dataType)
 	conn, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database %s: %w", dbPath, err)
@@ -41,80 +45,83 @@ func NewDB(dbPath string) (*DB, error) {
 		return nil, fmt.Errorf("failed to set WAL mode for %s: %w", dbPath, err)
 	}
 
-	// Создаём таблицу trades
-	_, err = conn.Exec(`
-		CREATE TABLE IF NOT EXISTS trades (
-			trade_id TEXT PRIMARY KEY,
-			timestamp INTEGER,
-			price REAL,
-			side TEXT,
-			volume_quote REAL,
-			size_base REAL
-		)
-	`)
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("failed to create trades table in %s: %w", dbPath, err)
-	}
-	log.Printf("Created trades table in %s", dbPath)
+	if dataType == "trades" {
+		// Создаём таблицу trades
+		_, err = conn.Exec(`
+			CREATE TABLE IF NOT EXISTS trades (
+				trade_id TEXT PRIMARY KEY,
+				timestamp INTEGER,
+				price REAL,
+				side TEXT,
+				volume_quote REAL,
+				size_base REAL
+			)
+		`)
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to create trades table in %s: %w", dbPath, err)
+		}
+		log.Printf("Created trades table in %s", dbPath)
 
-	// Создаём таблицу depth_1
-	_, err = conn.Exec(`
-		CREATE TABLE IF NOT EXISTS depth_1 (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			timestamp INTEGER,
-			ask_price REAL,
-			bid_price REAL,
-			ask_volume REAL,
-			bid_volume REAL
-		)
-	`)
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("failed to create depth_1 table in %s: %w", dbPath, err)
-	}
-	log.Printf("Created depth_1 table in %s", dbPath)
+		// Создаём индекс
+		_, err = conn.Exec("CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp)")
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to create index idx_trades_timestamp in %s: %w", dbPath, err)
+		}
+		log.Printf("Created index idx_trades_timestamp in %s", dbPath)
+	} else { // depth
+		// Создаём таблицу 1 (spot)
+		_, err = conn.Exec(`
+			CREATE TABLE IF NOT EXISTS "1" (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				timestamp INTEGER,
+				ask_price REAL,
+				bid_price REAL,
+				ask_volume REAL,
+				bid_volume REAL
+			)
+		`)
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to create table 1 in %s: %w", dbPath, err)
+		}
+		log.Printf("Created table 1 in %s", dbPath)
 
-	// Создаём таблицу depth_2
-	_, err = conn.Exec(`
-		CREATE TABLE IF NOT EXISTS depth_2 (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			timestamp INTEGER,
-			ask_price REAL,
-			bid_price REAL,
-			ask_volume REAL,
-			bid_volume REAL
-		)
-	`)
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("failed to create depth_2 table in %s: %w", dbPath, err)
-	}
-	log.Printf("Created depth_2 table in %s", dbPath)
+		// Создаём таблицу 2 (futures)
+		_, err = conn.Exec(`
+			CREATE TABLE IF NOT EXISTS "2" (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				timestamp INTEGER,
+				ask_price REAL,
+				bid_price REAL,
+				ask_volume REAL,
+				bid_volume REAL
+			)
+		`)
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to create table 2 in %s: %w", dbPath, err)
+		}
+		log.Printf("Created table 2 in %s", dbPath)
 
-	// Создаём индексы
-	_, err = conn.Exec("CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp)")
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("failed to create index idx_trades_timestamp in %s: %w", dbPath, err)
-	}
-	log.Printf("Created index idx_trades_timestamp in %s", dbPath)
+		// Создаём индексы
+		_, err = conn.Exec(`CREATE INDEX IF NOT EXISTS idx_1_timestamp ON "1"(timestamp)`)
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to create index idx_1_timestamp in %s: %w", dbPath, err)
+		}
+		log.Printf("Created index idx_1_timestamp in %s", dbPath)
 
-	_, err = conn.Exec("CREATE INDEX IF NOT EXISTS idx_depth_1_timestamp ON depth_1(timestamp)")
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("failed to create index idx_depth_1_timestamp in %s: %w", dbPath, err)
+		_, err = conn.Exec(`CREATE INDEX IF NOT EXISTS idx_2_timestamp ON "2"(timestamp)`)
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to create index idx_2_timestamp in %s: %w", dbPath, err)
+		}
+		log.Printf("Created index idx_2_timestamp in %s", dbPath)
 	}
-	log.Printf("Created index idx_depth_1_timestamp in %s", dbPath)
 
-	_, err = conn.Exec("CREATE INDEX IF NOT EXISTS idx_depth_2_timestamp ON depth_2(timestamp)")
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("failed to create index idx_depth_2_timestamp in %s: %w", dbPath, err)
-	}
-	log.Printf("Created index idx_depth_2_timestamp in %s", dbPath)
-
-	return &DB{conn: conn, path: dbPath}, nil
+	return &DB{conn: conn, path: dbPath, dataType: dataType}, nil
 }
 
 // Close закрывает подключение к базе и синкает WAL.
@@ -150,27 +157,20 @@ func (db *DB) ProcessZipFiles(zipFiles []string) error {
 		return fmt.Errorf("failed to create %s: %w", tmpDir, err)
 	}
 
-	// Дропаем таблицы depth перед обработкой
-	isDepth := false
-	for _, zipPath := range zipFiles {
-		if strings.Contains(strings.ToLower(zipPath), "/depth/") {
-			isDepth = true
-			break
-		}
-	}
-	if isDepth {
+	// Дропаем таблицы перед обработкой
+	if db.dataType == "depth" {
 		log.Printf("Dropping depth tables in %s", db.path)
-		_, err := db.conn.Exec("DROP TABLE IF EXISTS depth_1")
+		_, err := db.conn.Exec(`DROP TABLE IF EXISTS "1"`)
 		if err != nil {
-			return fmt.Errorf("failed to drop depth_1 table in %s: %w", db.path, err)
+			return fmt.Errorf("failed to drop table 1 in %s: %w", db.path, err)
 		}
-		_, err = db.conn.Exec("DROP TABLE IF EXISTS depth_2")
+		_, err = db.conn.Exec(`DROP TABLE IF EXISTS "2"`)
 		if err != nil {
-			return fmt.Errorf("failed to drop depth_2 table in %s: %w", db.path, err)
+			return fmt.Errorf("failed to drop table 2 in %s: %w", db.path, err)
 		}
-		// Пересоздаём таблицы depth
+		// Пересоздаём таблицы
 		_, err = db.conn.Exec(`
-			CREATE TABLE depth_1 (
+			CREATE TABLE "1" (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
 				timestamp INTEGER,
 				ask_price REAL,
@@ -180,11 +180,11 @@ func (db *DB) ProcessZipFiles(zipFiles []string) error {
 			)
 		`)
 		if err != nil {
-			return fmt.Errorf("failed to recreate depth_1 table in %s: %w", db.path, err)
+			return fmt.Errorf("failed to recreate table 1 in %s: %w", db.path, err)
 		}
-		log.Printf("Recreated depth_1 table in %s", db.path)
+		log.Printf("Recreated table 1 in %s", db.path)
 		_, err = db.conn.Exec(`
-			CREATE TABLE depth_2 (
+			CREATE TABLE "2" (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
 				timestamp INTEGER,
 				ask_price REAL,
@@ -194,20 +194,47 @@ func (db *DB) ProcessZipFiles(zipFiles []string) error {
 			)
 		`)
 		if err != nil {
-			return fmt.Errorf("failed to recreate depth_2 table in %s: %w", db.path, err)
+			return fmt.Errorf("failed to recreate table 2 in %s: %w", db.path, err)
 		}
-		log.Printf("Recreated depth_2 table in %s", db.path)
+		log.Printf("Recreated table 2 in %s", db.path)
 		// Пересоздаём индексы
-		_, err = db.conn.Exec("CREATE INDEX idx_depth_1_timestamp ON depth_1(timestamp)")
+		_, err = db.conn.Exec(`CREATE INDEX idx_1_timestamp ON "1"(timestamp)`)
 		if err != nil {
-			return fmt.Errorf("failed to recreate index idx_depth_1_timestamp in %s: %w", db.path, err)
+			return fmt.Errorf("failed to recreate index idx_1_timestamp in %s: %w", db.path, err)
 		}
-		log.Printf("Recreated index idx_depth_1_timestamp in %s", db.path)
-		_, err = db.conn.Exec("CREATE INDEX idx_depth_2_timestamp ON depth_2(timestamp)")
+		log.Printf("Recreated index idx_1_timestamp in %s", db.path)
+		_, err = db.conn.Exec(`CREATE INDEX idx_2_timestamp ON "2"(timestamp)`)
 		if err != nil {
-			return fmt.Errorf("failed to recreate index idx_depth_2_timestamp in %s: %w", db.path, err)
+			return fmt.Errorf("failed to recreate index idx_2_timestamp in %s: %w", db.path, err)
 		}
-		log.Printf("Recreated index idx_depth_2_timestamp in %s", db.path)
+		log.Printf("Recreated index idx_2_timestamp in %s", db.path)
+	} else if db.dataType == "trades" {
+		log.Printf("Dropping trades table in %s", db.path)
+		_, err := db.conn.Exec("DROP TABLE IF EXISTS trades")
+		if err != nil {
+			return fmt.Errorf("failed to drop trades table in %s: %w", db.path, err)
+		}
+		// Пересоздаём таблицу
+		_, err = db.conn.Exec(`
+			CREATE TABLE trades (
+				trade_id TEXT PRIMARY KEY,
+				timestamp INTEGER,
+				price REAL,
+				side TEXT,
+				volume_quote REAL,
+				size_base REAL
+			)
+		`)
+		if err != nil {
+			return fmt.Errorf("failed to recreate trades table in %s: %w", db.path, err)
+		}
+		log.Printf("Recreated trades table in %s", db.path)
+		// Пересоздаём индекс
+		_, err = db.conn.Exec("CREATE INDEX idx_trades_timestamp ON trades(timestamp)")
+		if err != nil {
+			return fmt.Errorf("failed to recreate index idx_trades_timestamp in %s: %w", db.path, err)
+		}
+		log.Printf("Recreated index idx_trades_timestamp in %s", db.path)
 	}
 
 	for _, zipPath := range zipFiles {
@@ -255,13 +282,13 @@ func (db *DB) processSingleZip(zipPath, tmpDir string) error {
 	}
 
 	// Формируем путь для CSV
-	zipBase := filepath.Base(zipPath)             // Например, "20250502.zip"
-	zipBase = strings.TrimSuffix(zipBase, ".zip") // "20250502"
+	zipBase := filepath.Base(zipPath)             // Например, "20250502_001.zip"
+	zipBase = strings.TrimSuffix(zipBase, ".zip") // "20250502_001"
 	pathParts := strings.Split(zipPath, string(os.PathSeparator))
 	marketCode := "unknown"
 	for i, part := range pathParts {
 		if part == "BTCUSDT" && i+1 < len(pathParts) {
-			marketCode = pathParts[i+1] // "1" или "2"
+			marketCode = pathParts[i+1] // "1", "2", "SPBL", "UMCBL"
 			break
 		}
 	}
@@ -289,12 +316,9 @@ func (db *DB) processSingleZip(zipPath, tmpDir string) error {
 		return fmt.Errorf("no CSV file found in %s (and no XLSX to convert)", zipPath)
 	}
 
-	// Определяем тип данных по пути
-	isDepth := strings.Contains(strings.ToLower(zipPath), "/depth/")
-
 	// Обрабатываем CSV
-	if isDepth {
-		tableName := fmt.Sprintf("depth_%s", marketCode)
+	if db.dataType == "depth" {
+		tableName := marketCode // "1" или "2"
 		return db.processDepthCSV(zipPath, csvPath, tableName)
 	}
 	return db.processTradesCSV(zipPath, csvPath)
@@ -498,10 +522,11 @@ func (db *DB) processTradesCSV(zipPath, csvPath string) error {
 			continue
 		}
 		affected, _ := result.RowsAffected()
-		if affected > 0 {
-			inserted++
-		} else {
+		if affected == 0 {
+			log.Printf("Skipped record in %s at line %d: duplicate trade_id %s", zipPath, i+1, tradeID)
 			skipped++
+		} else {
+			inserted++
 		}
 	}
 
@@ -543,7 +568,7 @@ func (db *DB) processDepthCSV(zipPath, csvPath, tableName string) error {
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction in %s: %w", db.path, err)
 	}
-	stmt, err := tx.Prepare(fmt.Sprintf("INSERT INTO %s (timestamp, ask_price, bid_price, ask_volume, bid_volume) VALUES (?, ?, ?, ?, ?)", tableName))
+	stmt, err := tx.Prepare(fmt.Sprintf(`INSERT INTO "%s" (timestamp, ask_price, bid_price, ask_volume, bid_volume) VALUES (?, ?, ?, ?, ?)`, tableName))
 	if err != nil {
 		tx.Rollback()
 		return fmt.Errorf("failed to prepare statement for table %s in %s: %w", tableName, db.path, err)
