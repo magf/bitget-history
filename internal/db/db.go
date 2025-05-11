@@ -56,10 +56,11 @@ func NewDB(dbPath string) (*DB, error) {
 		conn.Close()
 		return nil, fmt.Errorf("failed to create trades table in %s: %w", dbPath, err)
 	}
+	log.Printf("Created trades table in %s", dbPath)
 
-	// Создаём таблицу depth
+	// Создаём таблицу depth_1
 	_, err = conn.Exec(`
-		CREATE TABLE IF NOT EXISTS depth (
+		CREATE TABLE IF NOT EXISTS depth_1 (
 			timestamp INTEGER PRIMARY KEY,
 			ask_price REAL,
 			bid_price REAL,
@@ -69,8 +70,25 @@ func NewDB(dbPath string) (*DB, error) {
 	`)
 	if err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("failed to create depth table in %s: %w", dbPath, err)
+		return nil, fmt.Errorf("failed to create depth_1 table in %s: %w", dbPath, err)
 	}
+	log.Printf("Created depth_1 table in %s", dbPath)
+
+	// Создаём таблицу depth_2
+	_, err = conn.Exec(`
+		CREATE TABLE IF NOT EXISTS depth_2 (
+			timestamp INTEGER PRIMARY KEY,
+			ask_price REAL,
+			bid_price REAL,
+			ask_volume REAL,
+			bid_volume REAL
+		)
+	`)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to create depth_2 table in %s: %w", dbPath, err)
+	}
+	log.Printf("Created depth_2 table in %s", dbPath)
 
 	// Создаём индексы
 	_, err = conn.Exec("CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp)")
@@ -78,19 +96,34 @@ func NewDB(dbPath string) (*DB, error) {
 		conn.Close()
 		return nil, fmt.Errorf("failed to create index idx_trades_timestamp in %s: %w", dbPath, err)
 	}
-	_, err = conn.Exec("CREATE INDEX IF NOT EXISTS idx_depth_timestamp ON depth(timestamp)")
+	log.Printf("Created index idx_trades_timestamp in %s", dbPath)
+
+	_, err = conn.Exec("CREATE INDEX IF NOT EXISTS idx_depth_1_timestamp ON depth_1(timestamp)")
 	if err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("failed to create index idx_depth_timestamp in %s: %w", dbPath, err)
+		return nil, fmt.Errorf("failed to create index idx_depth_1_timestamp in %s: %w", dbPath, err)
 	}
+	log.Printf("Created index idx_depth_1_timestamp in %s", dbPath)
+
+	_, err = conn.Exec("CREATE INDEX IF NOT EXISTS idx_depth_2_timestamp ON depth_2(timestamp)")
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to create index idx_depth_2_timestamp in %s: %w", dbPath, err)
+	}
+	log.Printf("Created index idx_depth_2_timestamp in %s", dbPath)
 
 	return &DB{conn: conn, path: dbPath}, nil
 }
 
-// Close закрывает подключение к базе.
+// Close закрывает подключение к базе и синкает WAL.
 func (db *DB) Close() error {
 	log.Printf("Closing database: %s", db.path)
-	return db.conn.Close()
+	err := db.conn.Close()
+	if err != nil {
+		return fmt.Errorf("failed to close database %s: %w", db.path, err)
+	}
+	log.Printf("Database %s closed successfully", db.path)
+	return nil
 }
 
 // ProcessZipFiles обрабатывает Zip-файлы и выгружает данные в SQLite.
@@ -189,7 +222,8 @@ func (db *DB) processSingleZip(zipPath, tmpDir string) error {
 
 	// Обрабатываем CSV
 	if isDepth {
-		return db.processDepthCSV(zipPath, csvPath)
+		tableName := fmt.Sprintf("depth_%s", marketCode)
+		return db.processDepthCSV(zipPath, csvPath, tableName)
 	}
 	return db.processTradesCSV(zipPath, csvPath)
 }
@@ -327,6 +361,7 @@ func (db *DB) processTradesCSV(zipPath, csvPath string) error {
 	}
 	defer stmt.Close()
 
+	inserted := 0
 	for i, record := range records {
 		if i == 0 {
 			continue // Пропускаем заголовок
@@ -376,23 +411,36 @@ func (db *DB) processTradesCSV(zipPath, csvPath string) error {
 			continue
 		}
 
-		_, err = stmt.Exec(tradeID, timestamp, price, side, volumeQuote, sizeBase)
+		result, err := stmt.Exec(tradeID, timestamp, price, side, volumeQuote, sizeBase)
 		if err != nil {
 			log.Printf("Failed to insert record in %s at line %d: %v", zipPath, i+1, err)
 			continue
 		}
+		affected, _ := result.RowsAffected()
+		if affected > 0 {
+			inserted++
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
+		tx.Rollback()
 		return fmt.Errorf("failed to commit transaction in %s: %w", db.path, err)
 	}
+	log.Printf("Committed transaction for trades CSV %s in %s, inserted %d rows", csvPath, db.path, inserted)
 
-	log.Printf("Successfully processed trades CSV from %s into %s", zipPath, db.path)
+	// Выполняем чекпоинт WAL
+	_, err = db.conn.Exec("PRAGMA wal_checkpoint(TRUNCATE);")
+	if err != nil {
+		log.Printf("Failed to perform WAL checkpoint after trades CSV %s: %v", csvPath, err)
+	} else {
+		log.Printf("WAL checkpoint successful after trades CSV %s", csvPath)
+	}
+
 	return nil
 }
 
 // processDepthCSV обрабатывает CSV для depth.
-func (db *DB) processDepthCSV(zipPath, csvPath string) error {
+func (db *DB) processDepthCSV(zipPath, csvPath, tableName string) error {
 	csvFile, err := os.Open(csvPath)
 	if err != nil {
 		return fmt.Errorf("failed to open CSV %s: %w", csvPath, err)
@@ -412,13 +460,14 @@ func (db *DB) processDepthCSV(zipPath, csvPath string) error {
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction in %s: %w", db.path, err)
 	}
-	stmt, err := tx.Prepare("INSERT OR IGNORE INTO depth (timestamp, ask_price, bid_price, ask_volume, bid_volume) VALUES (?, ?, ?, ?, ?)")
+	stmt, err := tx.Prepare(fmt.Sprintf("INSERT OR IGNORE INTO %s (timestamp, ask_price, bid_price, ask_volume, bid_volume) VALUES (?, ?, ?, ?, ?)", tableName))
 	if err != nil {
 		tx.Rollback()
-		return fmt.Errorf("failed to prepare statement in %s: %w", db.path, err)
+		return fmt.Errorf("failed to prepare statement for table %s in %s: %w", tableName, db.path, err)
 	}
 	defer stmt.Close()
 
+	inserted := 0
 	for i, record := range records {
 		if i == 0 {
 			continue // Пропускаем заголовок
@@ -463,17 +512,30 @@ func (db *DB) processDepthCSV(zipPath, csvPath string) error {
 			continue
 		}
 
-		_, err = stmt.Exec(timestamp, askPrice, bidPrice, askVolume, bidVolume)
+		result, err := stmt.Exec(timestamp, askPrice, bidPrice, askVolume, bidVolume)
 		if err != nil {
 			log.Printf("Failed to insert record in %s at line %d: %v", zipPath, i+1, err)
 			continue
 		}
+		affected, _ := result.RowsAffected()
+		if affected > 0 {
+			inserted++
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction in %s: %w", db.path, err)
+		tx.Rollback()
+		return fmt.Errorf("failed to commit transaction for table %s in %s: %w", tableName, db.path, err)
+	}
+	log.Printf("Committed transaction for depth CSV %s in %s (table %s), inserted %d rows", csvPath, db.path, tableName, inserted)
+
+	// Выполняем чекпоинт WAL
+	_, err = db.conn.Exec("PRAGMA wal_checkpoint(TRUNCATE);")
+	if err != nil {
+		log.Printf("Failed to perform WAL checkpoint after depth CSV %s (table %s): %v", csvPath, tableName, err)
+	} else {
+		log.Printf("WAL checkpoint successful after depth CSV %s (table %s)", csvPath, tableName)
 	}
 
-	log.Printf("Successfully processed depth CSV from %s into %s", zipPath, db.path)
 	return nil
 }

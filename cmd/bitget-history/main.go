@@ -70,7 +70,7 @@ func main() {
 	// Выводим справку, если указан --help или нет параметров
 	if *helpFlag || len(os.Args) == 1 {
 		printHelp()
-		os.Exit(0)
+		return
 	}
 
 	// Проверяем обязательный флаг --type
@@ -193,7 +193,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to create database: %v", err)
 	}
-	defer dbInstance.Close()
+	defer func() {
+		log.Printf("Ensuring database close for %s", cfg.Database.Path)
+		if err := dbInstance.Close(); err != nil {
+			log.Printf("Failed to close database: %v", err)
+		}
+	}()
 
 	// Собираем пути к Zip-файлам
 	var zipFiles []string
@@ -206,11 +211,19 @@ func main() {
 	// Обрабатываем Zip-файлы и выгружаем в базу
 	log.Println("Processing and uploading files to database...")
 	if err := dbInstance.ProcessZipFiles(zipFiles); err != nil {
-		log.Fatalf("Failed to process zip files: %v", err)
+		log.Printf("Failed to process zip files: %v", err)
+		return
 	}
 
 	log.Println("Processing completed successfully")
-	os.Exit(0)
+
+	// Явный чекпоинт перед завершением
+	err = dbInstance.Close()
+	if err != nil {
+		log.Printf("Failed to perform final WAL checkpoint: %v", err)
+	} else {
+		log.Printf("Final WAL checkpoint successful")
+	}
 }
 
 // generateURLs генерирует список URL-ов на основе параметров.
