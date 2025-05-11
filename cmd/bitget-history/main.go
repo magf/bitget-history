@@ -1,439 +1,412 @@
-package main
+package db
 
 import (
-	"bufio"
-	"context"
-	"flag"
+	"archive/zip"
+	"database/sql"
+	"encoding/csv"
 	"fmt"
+	"io"
 	"log"
-	"math"
-	"math/rand"
-	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
 
-	"github.com/magf/bitget-history/internal/db"
-	"github.com/magf/bitget-history/internal/downloader"
-	"github.com/magf/bitget-history/internal/proxymanager"
-	"golang.org/x/net/proxy"
-	"gopkg.in/yaml.v3"
-
-	_ "github.com/bdandy/go-socks4" // Поддержка SOCKS4
+	_ "github.com/mattn/go-sqlite3" // Драйвер SQLite
+	"github.com/tealeg/xlsx/v3"
 )
 
-// Config представляет структуру конфигурационного файла.
-type Config struct {
-	Proxy struct {
-		RawFile     string `yaml:"raw_file"`
-		WorkingFile string `yaml:"working_file"`
-		Fallback    string `yaml:"fallback"`
-		Username    string `yaml:"username"`
-		Password    string `yaml:"password"`
-	} `yaml:"proxy"`
-	Database struct {
-		Path string `yaml:"path"`
-	} `yaml:"database"`
-	Downloader struct {
-		BaseURL   string `yaml:"base_url"`
-		UserAgent string `yaml:"user_agent"`
-	} `yaml:"downloader"`
+// DB управляет подключением к SQLite и выгрузкой данных.
+type DB struct {
+	conn *sql.DB
+	path string // Для логирования
 }
 
-func main() {
-	// Парсим флаги
-	helpFlag := flag.Bool("help", false, "Show help message")
-	pairFlag := flag.String("pair", "BTCUSDT", "Trading pair (e.g., BTCUSDT)")
-	typeFlag := flag.String("type", "", "Data type: trades or depth")
-	marketFlag := flag.String("market", "all", "Market type: spot, futures or all")
-	startFlag := flag.String("start", "", "Start date (YYYY-MM-DD, default: 1 year ago)")
-	endFlag := flag.String("end", "", "End date (YYYY-MM-DD, default: today)")
-	timeoutFlag := flag.Int("timeout", 3, "Proxy check timeout in seconds")
-	debugFlag := flag.Bool("debug", false, "Enable debug logging")
-
-	// Короткие флаги
-	flag.BoolVar(helpFlag, "h", false, "Show help message (short)")
-	flag.StringVar(pairFlag, "p", "BTCUSDT", "Trading pair (short)")
-	flag.StringVar(typeFlag, "t", "", "Data type (short)")
-	flag.StringVar(marketFlag, "m", "all", "Market type (short)")
-	flag.StringVar(startFlag, "s", "", "Start date (short)")
-	flag.StringVar(endFlag, "e", "", "End date (short)")
-	flag.IntVar(timeoutFlag, "T", 3, "Proxy check timeout in seconds (short)")
-	flag.BoolVar(debugFlag, "d", false, "Enable debug logging (short)")
-
-	flag.Parse()
-
-	// Выводим справку, если указан --help или нет параметров
-	if *helpFlag || len(os.Args) == 1 {
-		printHelp()
-		os.Exit(0)
+// NewDB создаёт новое подключение к SQLite и инициализирует схему.
+func NewDB(dbPath string) (*DB, error) {
+	// Проверяем, что путь не содержит шаблонов
+	if strings.Contains(dbPath, "%s") {
+		return nil, fmt.Errorf("invalid database path: %s contains placeholder %%s", dbPath)
 	}
-
-	// Проверяем обязательный флаг --type
-	if *typeFlag == "" {
-		log.Fatal("Error: --type (-t) is required (trades or depth)")
-	}
-	if *typeFlag != "trades" && *typeFlag != "depth" {
-		log.Fatalf("Error: invalid --type value: %s (must be trades or depth)", *typeFlag)
-	}
-
-	// Проверяем market
-	if *marketFlag != "spot" && *marketFlag != "futures" && *marketFlag != "all" {
-		log.Fatalf("Error: invalid --market value: %s (must be spot, futures or all)", *marketFlag)
-	}
-	// Для trades значение all недопустимо
-	if *typeFlag == "trades" && *marketFlag == "all" {
-		log.Fatal("Error: --market all is not supported for trades (use spot or futures)")
-	}
-
-	// Устанавливаем даты
-	endDate := time.Now()
-	if *endFlag != "" {
-		var err error
-		endDate, err = time.Parse("2006-01-02", *endFlag)
-		if err != nil {
-			log.Fatalf("Error: invalid --end format: %v", err)
-		}
-	}
-	startDate := endDate.AddDate(-1, 0, 0)
-	if *startFlag != "" {
-		var err error
-		startDate, err = time.Parse("2006-01-02", *startFlag)
-		if err != nil {
-			log.Fatalf("Error: invalid --start format: %v", err)
-		}
-	}
-
-	// Проверяем даты
-	if startDate.After(endDate) {
-		log.Fatal("Error: start date is after end date")
-	}
-
-	// Включаем дебаг-логирование
-	if *debugFlag {
-		log.SetFlags(log.LstdFlags | log.Lshortfile)
-	}
-
-	// Читаем конфиг
-	configFile := filepath.Join("config", "config.yaml")
-	configOverrideFile := filepath.Join("config", "config-override.yaml")
-	var cfg Config
-
-	// Читаем основной конфиг
-	data, err := os.ReadFile(configFile)
+	log.Printf("Opening database: %s", dbPath)
+	conn, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
-		log.Fatalf("Failed to read config %s: %v", configFile, err)
-	}
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		log.Fatalf("Failed to parse config %s: %v", configFile, err)
+		return nil, fmt.Errorf("failed to open database %s: %w", dbPath, err)
 	}
 
-	// Читаем переопределение, если есть
-	if _, err := os.Stat(configOverrideFile); err == nil {
-		overrideData, err := os.ReadFile(configOverrideFile)
-		if err != nil {
-			log.Fatalf("Failed to read override config %s: %v", configOverrideFile, err)
-		}
-		if err := yaml.Unmarshal(overrideData, &cfg); err != nil {
-			log.Fatalf("Failed to parse override config %s: %v", configOverrideFile, err)
-		}
-	}
-
-	// Проверяем путь к базе
-	if cfg.Database.Path == "" || strings.Contains(cfg.Database.Path, "%s") {
-		log.Fatalf("Error: invalid database path in config: %s", cfg.Database.Path)
-	}
-	log.Printf("Using database path from config: %s", cfg.Database.Path)
-
-	// Создаём ProxyManager
-	timeout := time.Duration(*timeoutFlag) * time.Second
-	pm, err := proxymanager.NewProxyManager(cfg.Proxy.RawFile, cfg.Proxy.WorkingFile, cfg.Proxy.Fallback, cfg.Proxy.Username, cfg.Proxy.Password, timeout)
+	// Включаем WAL для производительности
+	_, err = conn.Exec("PRAGMA journal_mode=WAL;")
 	if err != nil {
-		log.Fatalf("Failed to create proxy manager: %v", err)
+		conn.Close()
+		return nil, fmt.Errorf("failed to set WAL mode for %s: %w", dbPath, err)
 	}
 
-	// Проверяем прокси
-	log.Println("Ensuring proxies...")
-	if err := pm.EnsureProxies(context.Background()); err != nil {
-		log.Fatalf("Failed to ensure proxies: %v", err)
-	}
-
-	// Получаем рабочие прокси
-	proxies, err := pm.GetProxies()
+	// Создаём таблицу trades
+	_, err = conn.Exec(`
+		CREATE TABLE IF NOT EXISTS trades (
+			trade_id TEXT PRIMARY KEY,
+			timestamp INTEGER,
+			price REAL,
+			side TEXT,
+			volume_quote REAL,
+			size_base REAL
+		)
+	`)
 	if err != nil {
-		log.Fatalf("Failed to get proxies: %v", err)
+		conn.Close()
+		return nil, fmt.Errorf("failed to create trades table in %s: %w", dbPath, err)
 	}
-	log.Printf("Found %d working proxies", len(proxies))
 
-	// Создаём Downloader
-	outputDir := "/var/lib/bitget-history/offline"
-	dl, err := downloader.NewDownloader(cfg.Downloader.BaseURL, cfg.Downloader.UserAgent, outputDir, pm)
+	// Создаём таблицу depth
+	_, err = conn.Exec(`
+		CREATE TABLE IF NOT EXISTS depth (
+			timestamp INTEGER PRIMARY KEY,
+			ask_price REAL,
+			bid_price REAL,
+			ask_volume REAL,
+			bid_volume REAL
+		)
+	`)
 	if err != nil {
-		log.Fatalf("Failed to create downloader: %v", err)
+		conn.Close()
+		return nil, fmt.Errorf("failed to create depth table in %s: %w", dbPath, err)
 	}
 
-	// Генерируем URL-ы
-	urls, err := generateURLs(cfg.Downloader.BaseURL, *marketFlag, *pairFlag, *typeFlag, startDate, endDate, *debugFlag, proxies, cfg.Downloader.UserAgent)
+	// Создаём индексы
+	_, err = conn.Exec("CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp)")
 	if err != nil {
-		log.Fatalf("Failed to generate URLs: %v", err)
+		conn.Close()
+		return nil, fmt.Errorf("failed to create index idx_trades_timestamp in %s: %w", dbPath, err)
 	}
-
-	// Запускаем загрузку
-	log.Println("Downloading files...")
-	if err := dl.DownloadFiles(context.Background(), urls); err != nil {
-		log.Fatalf("Failed to download files: %v", err)
-	}
-
-	// Создаём DB
-	dbInstance, err := db.NewDB(cfg.Database.Path)
+	_, err = conn.Exec("CREATE INDEX IF NOT EXISTS idx_depth_timestamp ON depth(timestamp)")
 	if err != nil {
-		log.Fatalf("Failed to create database: %v", err)
-	}
-	defer dbInstance.Close()
-
-	// Собираем пути к Zip-файлам
-	var zipFiles []string
-	for _, fileInfo := range urls {
-		relativePath := strings.TrimPrefix(fileInfo.URL, cfg.Downloader.BaseURL+"/")
-		zipPath := filepath.Join(outputDir, relativePath)
-		zipFiles = append(zipFiles, zipPath)
+		conn.Close()
+		return nil, fmt.Errorf("failed to create index idx_depth_timestamp in %s: %w", dbPath, err)
 	}
 
-	// Обрабатываем Zip-файлы и выгружаем в базу
-	log.Println("Processing and uploading files to database...")
-	if err := dbInstance.ProcessZipFiles(zipFiles); err != nil {
-		log.Fatalf("Failed to process zip files: %v", err)
-	}
-
-	log.Println("Processing completed successfully")
-	os.Exit(0)
+	return &DB{conn: conn, path: dbPath}, nil
 }
 
-// generateURLs генерирует список URL-ов на основе параметров.
-func generateURLs(baseURL, market, pair, dataType string, startDate, endDate time.Time, debug bool, proxies []string, userAgent string) ([]downloader.FileInfo, error) {
-	var urls []downloader.FileInfo
-	days := int(endDate.Sub(startDate).Hours()/24) + 1
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-
-	if dataType == "trades" {
-		marketCode := "SPBL"
-		if market == "futures" {
-			marketCode = "UMCBL"
-		}
-		for d := startDate; !d.After(endDate); d = d.AddDate(0, 0, 1) {
-			dateStr := d.Format("20060102")
-			// Проверяем файлы пачками по 10
-			for startNum := 1; startNum <= 999; startNum += 10 {
-				endNum := startNum + 9
-				if endNum > 999 {
-					endNum = 999
-				}
-				batchURLs := make([]string, 0, endNum-startNum+1)
-				for num := startNum; num <= endNum; num++ {
-					path := fmt.Sprintf("trades/%s/%s/%s_%03d.zip", marketCode, pair, dateStr, num)
-					url := fmt.Sprintf("%s/%s", baseURL, path)
-					batchURLs = append(batchURLs, url)
-				}
-
-				// Параллельная проверка пачки
-				stopBatch := false
-				for _, url := range batchURLs {
-					wg.Add(1)
-					go func(url string) {
-						defer wg.Done()
-						exists, contentLength, err := checkFileExists(url, proxies, userAgent, debug)
-						if err != nil {
-							if debug {
-								log.Printf("Error checking %s: %v", url, err)
-							}
-							return
-						}
-						if !exists {
-							if debug {
-								log.Printf("Stopping at %s: file does not exist", url)
-							}
-							mu.Lock()
-							stopBatch = true
-							mu.Unlock()
-							return
-						}
-						mu.Lock()
-						urls = append(urls, downloader.FileInfo{URL: url, ContentLength: contentLength})
-						mu.Unlock()
-						if debug {
-							log.Printf("Generated URL: %s (Content-Length: %d)", url, contentLength)
-						}
-					}(url)
-				}
-				wg.Wait()
-				if stopBatch {
-					break // Прерываем цикл для этой даты
-				}
-			}
-		}
-	} else { // depth
-		// Выбираем marketCodes в зависимости от --market
-		marketCodes := []string{"1"} // spot по умолчанию
-		if market == "futures" {
-			marketCodes = []string{"2"}
-		} else if market == "all" {
-			marketCodes = []string{"1", "2"}
-		}
-		for _, marketCode := range marketCodes {
-			for d := startDate; !d.After(endDate); d = d.AddDate(0, 0, 1) {
-				path := fmt.Sprintf("depth/%s/%s/%s.zip", pair, marketCode, d.Format("20060102"))
-				url := fmt.Sprintf("%s/%s", baseURL, path)
-
-				wg.Add(1)
-				go func(url string) {
-					defer wg.Done()
-					exists, contentLength, err := checkFileExists(url, proxies, userAgent, debug)
-					if err != nil {
-						if debug {
-							log.Printf("Error checking %s: %v", url, err)
-						}
-						return
-					}
-					if !exists {
-						if debug {
-							log.Printf("Skipping %s: file does not exist", url)
-						}
-						return
-					}
-					mu.Lock()
-					urls = append(urls, downloader.FileInfo{URL: url, ContentLength: contentLength})
-					mu.Unlock()
-					if debug {
-						log.Printf("Generated URL: %s (Content-Length: %d)", url, contentLength)
-					}
-				}(url)
-			}
-		}
-	}
-
-	wg.Wait()
-
-	// Вычисляем коэффициент ротации прокси
-	proxyCount, err := readProxyCount()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read proxy count: %w", err)
-	}
-	rotationFactor := int(math.Ceil(float64(days) / float64(proxyCount)))
-	if debug {
-		log.Printf("Days: %d, Proxies: %d, Rotation factor: %d", days, proxyCount, rotationFactor)
-	}
-
-	return urls, nil
+// Close закрывает подключение к базе.
+func (db *DB) Close() error {
+	log.Printf("Closing database: %s", db.path)
+	return db.conn.Close()
 }
 
-// checkFileExists проверяет существование файла через HEAD-запрос и возвращает Content-Length.
-func checkFileExists(urlStr string, proxies []string, userAgent string, debug bool) (bool, int64, error) {
-	maxAttempts := 3
-	var lastErr error
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		// Выбираем случайный прокси
-		proxyIndex := rand.Intn(len(proxies))
-		proxyURLStr := proxies[proxyIndex]
-		proxyURL, err := url.Parse(proxyURLStr)
+// ProcessZipFiles обрабатывает Zip-файлы и выгружает данные в SQLite.
+func (db *DB) ProcessZipFiles(zipFiles []string) error {
+	tmpDir := "/tmp/bitget-history"
+	// Очищаем /tmp/bitget-history перед началом
+	log.Printf("Cleaning temporary directory: %s", tmpDir)
+	if err := os.RemoveAll(tmpDir); err != nil {
+		return fmt.Errorf("failed to clean %s: %w", tmpDir, err)
+	}
+	if err := os.MkdirAll(tmpDir, 0755); err != nil {
+		return fmt.Errorf("failed to create %s: %w", tmpDir, err)
+	}
+
+	for _, zipPath := range zipFiles {
+		log.Printf("Processing zip file: %s", zipPath)
+		if err := db.processSingleZip(zipPath, tmpDir); err != nil {
+			log.Printf("Failed to process %s: %v", zipPath, err)
+			continue // Продолжаем с другими файлами
+		}
+	}
+
+	log.Printf("Temporary files left in %s for debugging", tmpDir)
+	return nil
+}
+
+// processSingleZip обрабатывает один Zip-файл.
+func (db *DB) processSingleZip(zipPath, tmpDir string) error {
+	// Открываем Zip
+	zipReader, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return fmt.Errorf("failed to open zip %s: %w", zipPath, err)
+	}
+	defer zipReader.Close()
+
+	// Проверяем файлы в Zip
+	for _, f := range zipReader.File {
+		rc, err := f.Open()
 		if err != nil {
-			if debug {
-				log.Printf("Invalid proxy URL %s: %v", proxyURLStr, err)
-			}
-			lastErr = err
+			return fmt.Errorf("corrupted zip %s: failed to open file %s: %w", zipPath, f.Name, err)
+		}
+		rc.Close()
+	}
+
+	// Ищем CSV или XLSX
+	var csvFile *zip.File
+	var xlsxFile *zip.File
+	for _, f := range zipReader.File {
+		if strings.HasSuffix(strings.ToLower(f.Name), ".csv") {
+			csvFile = f
+			break
+		}
+		if strings.HasSuffix(strings.ToLower(f.Name), ".xlsx") {
+			xlsxFile = f
+			break
+		}
+	}
+
+	// Формируем путь для CSV
+	zipBase := filepath.Base(zipPath)             // Например, "20250502.zip"
+	zipBase = strings.TrimSuffix(zipBase, ".zip") // "20250502"
+	pathParts := strings.Split(zipPath, string(os.PathSeparator))
+	marketCode := "unknown"
+	for i, part := range pathParts {
+		if part == "BTCUSDT" && i+1 < len(pathParts) {
+			marketCode = pathParts[i+1] // "1" или "2"
+			break
+		}
+	}
+	csvFileName := fmt.Sprintf("%s_%s.csv", marketCode, zipBase)
+	csvPath := filepath.Join(tmpDir, csvFileName)
+
+	// Если CSV найден, извлекаем его
+	if csvFile != nil {
+		if err := extractFile(csvFile, csvPath); err != nil {
+			return fmt.Errorf("failed to extract CSV from %s: %w", zipPath, err)
+		}
+		log.Printf("Extracted CSV: %s", csvPath)
+	} else if xlsxFile != nil {
+		// Извлекаем XLSX
+		xlsxPath := filepath.Join(tmpDir, xlsxFile.Name)
+		if err := extractFile(xlsxFile, xlsxPath); err != nil {
+			return fmt.Errorf("failed to extract XLSX from %s: %w", zipPath, err)
+		}
+		// Конвертируем XLSX в CSV
+		if err := convertXLSXtoCSV(xlsxPath, csvPath); err != nil {
+			return fmt.Errorf("failed to convert XLSX to CSV for %s: %w", zipPath, err)
+		}
+		log.Printf("Converted XLSX to CSV: %s", csvPath)
+	} else {
+		return fmt.Errorf("no CSV file found in %s (and no XLSX to convert)", zipPath)
+	}
+
+	// Определяем тип данных по пути
+	isDepth := strings.Contains(strings.ToLower(zipPath), "/depth/")
+
+	// Обрабатываем CSV
+	if isDepth {
+		return db.processDepthCSV(zipPath, csvPath)
+	}
+	return db.processTradesCSV(zipPath, csvPath)
+}
+
+// extractFile извлекает файл из Zip в указанный путь.
+func extractFile(file *zip.File, destPath string) error {
+	fileReader, err := file.Open()
+	if err != nil {
+		return err
+	}
+	defer fileReader.Close()
+
+	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+		return err
+	}
+
+	outFile, err := os.Create(destPath)
+	if err != nil {
+		return err
+	}
+	defer outFile.Close()
+
+	_, err = io.Copy(outFile, fileReader)
+	return err
+}
+
+// convertXLSXtoCSV конвертирует XLSX в CSV.
+func convertXLSXtoCSV(xlsxPath, csvPath string) error {
+	xlsxFile, err := xlsx.OpenFile(xlsxPath)
+	if err != nil {
+		return fmt.Errorf("failed to open XLSX %s: %w", xlsxPath, err)
+	}
+
+	if len(xlsxFile.Sheets) == 0 {
+		return fmt.Errorf("no sheets found in XLSX %s", xlsxPath)
+	}
+
+	// Берем первый лист и конвертируем в CSV
+	sheet := xlsxFile.Sheets[0]
+	return sheet.ToCsv(csvPath)
+}
+
+// processTradesCSV обрабатывает CSV для trades.
+func (db *DB) processTradesCSV(zipPath, csvPath string) error {
+	csvFile, err := os.Open(csvPath)
+	if err != nil {
+		return fmt.Errorf("failed to open CSV %s: %w", csvPath, err)
+	}
+	defer csvFile.Close()
+
+	reader := csv.NewReader(csvFile)
+	reader.FieldsPerRecord = -1 // Разрешить разное количество полей
+	records, err := reader.ReadAll()
+	if err != nil {
+		return fmt.Errorf("failed to read CSV %s: %w", csvPath, err)
+	}
+
+	log.Printf("Processed %d rows from CSV: %s", len(records)-1, csvPath)
+
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction in %s: %w", db.path, err)
+	}
+	stmt, err := tx.Prepare("INSERT OR IGNORE INTO trades (trade_id, timestamp, price, side, volume_quote, size_base) VALUES (?, ?, ?, ?, ?, ?)")
+	if err != nil {
+		tx.Rollback()
+		return fmt.Errorf("failed to prepare statement in %s: %w", db.path, err)
+	}
+	defer stmt.Close()
+
+	for i, record := range records {
+		if i == 0 {
+			continue // Пропускаем заголовок
+		}
+		if len(record) < 6 {
+			log.Printf("Skipping invalid record in %s at line %d: %v", zipPath, i+1, record)
 			continue
 		}
 
-		dialer, err := proxy.FromURL(proxyURL, proxy.Direct)
-		if err != nil {
-			if debug {
-				log.Printf("Failed to create proxy %s: %v", proxyURLStr, err)
-			}
-			lastErr = err
+		tradeID := strings.TrimSpace(record[0])
+		if tradeID == "" {
+			log.Printf("Skipping record in %s at line %d: empty trade_id", zipPath, i+1)
 			continue
 		}
 
-		client := &http.Client{
-			Transport: &http.Transport{
-				Dial: dialer.Dial,
-			},
-			Timeout: 15 * time.Second,
-		}
-
-		req, err := http.NewRequest("HEAD", urlStr, nil)
+		timestampStr := strings.TrimSpace(record[1])
+		timestamp, err := strconv.ParseInt(timestampStr, 10, 64)
 		if err != nil {
-			if debug {
-				log.Printf("Failed to create request for %s: %v", urlStr, err)
-			}
-			lastErr = err
+			log.Printf("Skipping record in %s at line %d: invalid timestamp %s", zipPath, i+1, timestampStr)
 			continue
 		}
-		req.Header.Set("User-Agent", userAgent)
 
-		resp, err := client.Do(req)
+		priceStr := strings.TrimSpace(record[2])
+		price, err := strconv.ParseFloat(priceStr, 64)
 		if err != nil {
-			if debug {
-				log.Printf("Attempt %d: Failed to HEAD %s with proxy %s: %v", attempt, urlStr, proxyURLStr, err)
-			}
-			lastErr = err
+			log.Printf("Skipping record in %s at line %d: invalid price %s", zipPath, i+1, priceStr)
 			continue
 		}
-		defer resp.Body.Close()
 
-		if debug {
-			log.Printf("Checked %s with proxy %s: status %d", urlStr, proxyURLStr, resp.StatusCode)
+		side := strings.TrimSpace(record[3])
+		if side != "buy" && side != "sell" {
+			log.Printf("Skipping record in %s at line %d: invalid side %s", zipPath, i+1, side)
+			continue
 		}
-		// Явно считаем файл существующим только при 200-399, иначе прерываем при 400+
-		if resp.StatusCode >= 200 && resp.StatusCode < 400 {
-			contentLengthStr := resp.Header.Get("Content-Length")
-			contentLength, _ := strconv.ParseInt(contentLengthStr, 10, 64) // Игнорируем ошибку, если заголовок отсутствует
-			return true, contentLength, nil
-		} else if resp.StatusCode >= 400 {
-			return false, 0, nil
+
+		volumeQuoteStr := strings.TrimSpace(record[4])
+		volumeQuote, err := strconv.ParseFloat(volumeQuoteStr, 64)
+		if err != nil {
+			log.Printf("Skipping record in %s at line %d: invalid volume_quote %s", zipPath, i+1, volumeQuoteStr)
+			continue
+		}
+
+		sizeBaseStr := strings.TrimSpace(record[5])
+		sizeBase, err := strconv.ParseFloat(sizeBaseStr, 64)
+		if err != nil {
+			log.Printf("Skipping record in %s at line %d: invalid size_base %s", zipPath, i+1, sizeBaseStr)
+			continue
+		}
+
+		_, err = stmt.Exec(tradeID, timestamp, price, side, volumeQuote, sizeBase)
+		if err != nil {
+			log.Printf("Failed to insert record in %s at line %d: %v", zipPath, i+1, err)
+			continue
 		}
 	}
-	if debug {
-		log.Printf("File %s skipped after %d attempts due to error: %v", urlStr, maxAttempts, lastErr)
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction in %s: %w", db.path, err)
 	}
-	return false, 0, fmt.Errorf("failed to check %s after %d attempts: %v", urlStr, maxAttempts, lastErr)
+
+	log.Printf("Successfully processed trades CSV from %s into %s", zipPath, db.path)
+	return nil
 }
 
-// readProxyCount читает количество прокси из файла.
-func readProxyCount() (int, error) {
-	file, err := os.Open("data/proxies.txt")
+// processDepthCSV обрабатывает CSV для depth.
+func (db *DB) processDepthCSV(zipPath, csvPath string) error {
+	csvFile, err := os.Open(csvPath)
 	if err != nil {
-		return 0, err
+		return fmt.Errorf("failed to open CSV %s: %w", csvPath, err)
 	}
-	defer file.Close()
+	defer csvFile.Close()
 
-	count := 0
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		if strings.TrimSpace(scanner.Text()) != "" {
-			count++
+	reader := csv.NewReader(csvFile)
+	reader.FieldsPerRecord = -1 // Разрешить разное количество полей
+	records, err := reader.ReadAll()
+	if err != nil {
+		return fmt.Errorf("failed to read CSV %s: %w", csvPath, err)
+	}
+
+	log.Printf("Processed %d rows from CSV: %s", len(records)-1, csvPath)
+
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction in %s: %w", db.path, err)
+	}
+	stmt, err := tx.Prepare("INSERT OR IGNORE INTO depth (timestamp, ask_price, bid_price, ask_volume, bid_volume) VALUES (?, ?, ?, ?, ?)")
+	if err != nil {
+		tx.Rollback()
+		return fmt.Errorf("failed to prepare statement in %s: %w", db.path, err)
+	}
+	defer stmt.Close()
+
+	for i, record := range records {
+		if i == 0 {
+			continue // Пропускаем заголовок
+		}
+
+		for len(record) < 5 {
+			record = append(record, "0.0")
+		}
+
+		timestampStr := strings.TrimSpace(record[0])
+		timestamp, err := strconv.ParseInt(timestampStr, 10, 64)
+		if err != nil {
+			log.Printf("Skipping record in %s at line %d: invalid timestamp %s: %v", zipPath, i+1, timestampStr, record)
+			continue
+		}
+
+		askPriceStr := strings.TrimSpace(record[1])
+		askPrice, err := strconv.ParseFloat(askPriceStr, 64)
+		if err != nil {
+			log.Printf("Skipping record in %s at line %d: invalid ask_price %s: %v", zipPath, i+1, askPriceStr, record)
+			continue
+		}
+
+		bidPriceStr := strings.TrimSpace(record[2])
+		bidPrice, err := strconv.ParseFloat(bidPriceStr, 64)
+		if err != nil {
+			log.Printf("Skipping record in %s at line %d: invalid bid_price %s: %v", zipPath, i+1, bidPriceStr, record)
+			continue
+		}
+
+		askVolumeStr := strings.TrimSpace(record[3])
+		askVolume, err := strconv.ParseFloat(askVolumeStr, 64)
+		if err != nil {
+			log.Printf("Skipping record in %s at line %d: invalid ask_volume %s: %v", zipPath, i+1, askVolumeStr, record)
+			continue
+		}
+
+		bidVolumeStr := strings.TrimSpace(record[4])
+		bidVolume, err := strconv.ParseFloat(bidVolumeStr, 64)
+		if err != nil {
+			log.Printf("Skipping record in %s at line %d: invalid bid_volume %s: %v", zipPath, i+1, bidVolumeStr, record)
+			continue
+		}
+
+		_, err = stmt.Exec(timestamp, askPrice, bidPrice, askVolume, bidVolume)
+		if err != nil {
+			log.Printf("Failed to insert record in %s at line %d: %v", zipPath, i+1, err)
+			continue
 		}
 	}
-	if count == 0 {
-		return 0, fmt.Errorf("proxy list is empty")
-	}
-	return count, scanner.Err()
-}
 
-// printHelp выводит справку.
-func printHelp() {
-	fmt.Println("Bitget History Downloader")
-	fmt.Println("Usage: bitget-history [options]")
-	fmt.Println("Options:")
-	fmt.Println("  --help, -h          Show this help message")
-	fmt.Println("  --pair, -p string   Trading pair (e.g., BTCUSDT) (default: BTCUSDT)")
-	fmt.Println("  --type, -t string   Data type: trades or depth (required)")
-	fmt.Println("  --market, -m string Market type: spot, futures or all (default: all)")
-	fmt.Println("  --start, -s string  Start date (YYYY-MM-DD, default: 1 year ago)")
-	fmt.Println("  --end, -e string    End date (YYYY-MM-DD, default: today)")
-	fmt.Println("  --timeout, -T int   Proxy check timeout in seconds (default: 3)")
-	fmt.Println("  --debug, -d         Enable debug logging")
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction in %s: %w", db.path, err)
+	}
+
+	log.Printf("Successfully processed depth CSV from %s into %s", zipPath, db.path)
+	return nil
 }
