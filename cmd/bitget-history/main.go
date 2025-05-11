@@ -157,19 +157,6 @@ func main() {
 		log.Fatalf("Failed to create proxy manager: %v", err)
 	}
 
-	// Проверяем прокси
-	log.Println("Ensuring proxies...")
-	if err := pm.EnsureProxies(context.Background()); err != nil {
-		log.Fatalf("Failed to ensure proxies: %v", err)
-	}
-
-	// Получаем рабочие прокси
-	proxies, err := pm.GetProxies()
-	if err != nil {
-		log.Fatalf("Failed to get proxies: %v", err)
-	}
-	log.Printf("Found %d working proxies", len(proxies))
-
 	// Создаём Downloader
 	outputDir := "/var/lib/bitget-history/offline"
 	dl, err := downloader.NewDownloader(cfg.Downloader.BaseURL, cfg.Downloader.UserAgent, outputDir, pm)
@@ -185,6 +172,19 @@ func main() {
 
 	// Основной цикл
 	for {
+		// Проверяем прокси
+		log.Println("Ensuring proxies...")
+		if err := pm.EnsureProxies(context.Background()); err != nil {
+			log.Fatalf("Failed to ensure proxies: %v", err)
+		}
+
+		// Получаем рабочие прокси
+		proxies, err := pm.GetProxies()
+		if err != nil {
+			log.Fatalf("Failed to get proxies: %v", err)
+		}
+		log.Printf("Found %d working proxies", len(proxies))
+
 		// Генерируем URL-ы
 		urls, err := generateURLs(cfg.Downloader.BaseURL, *marketFlag, *pairFlag, *typeFlag, startDate, endDate, *debugFlag, *skipIfExistsFlag, proxies, cfg.Downloader.UserAgent, outputDir)
 		if err != nil {
