@@ -5,12 +5,15 @@ import (
 	"database/sql"
 	"encoding/csv"
 	"fmt"
+	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
 	_ "github.com/mattn/go-sqlite3" // Драйвер SQLite
+	"github.com/tealeg/xlsx/v3"
 )
 
 // DB управляет подключением к SQLite и выгрузкой данных.
@@ -45,8 +48,8 @@ func NewDB(dbPath string) (*DB, error) {
 			timestamp INTEGER,
 			price REAL,
 			side TEXT,
-			volume_quote REAL, -- Мапится на volume(quote) из CSV
-			size_base REAL     -- Мапится на size(base) из CSV
+			volume_quote REAL,
+			size_base REAL
 		)
 	`)
 	if err != nil {
@@ -54,7 +57,7 @@ func NewDB(dbPath string) (*DB, error) {
 		return nil, fmt.Errorf("failed to create trades table in %s: %w", dbPath, err)
 	}
 
-	// Создаём таблицу depth (для будущего)
+	// Создаём таблицу depth
 	_, err = conn.Exec(`
 		CREATE TABLE IF NOT EXISTS depth (
 			timestamp INTEGER PRIMARY KEY,
@@ -110,7 +113,6 @@ func (db *DB) ProcessZipFiles(zipFiles []string) error {
 		}
 	}
 
-	// Не удаляем файлы в /tmp после обработки (для разработки)
 	log.Printf("Temporary files left in %s for debugging", tmpDir)
 	return nil
 }
@@ -124,34 +126,196 @@ func (db *DB) processSingleZip(zipPath, tmpDir string) error {
 	}
 	defer zipReader.Close()
 
-	// Ищем CSV-файл (trades.csv)
+	// Проверяем файлы в Zip
+	for _, f := range zipReader.File {
+		rc, err := f.Open()
+		if err != nil {
+			return fmt.Errorf("corrupted zip %s: failed to open file %s: %w", zipPath, f.Name, err)
+		}
+		rc.Close()
+	}
+
+	// Ищем CSV или XLSX
 	var csvFile *zip.File
+	var xlsxFile *zip.File
 	for _, f := range zipReader.File {
 		if strings.HasSuffix(strings.ToLower(f.Name), ".csv") {
 			csvFile = f
 			break
 		}
-	}
-	if csvFile == nil {
-		return fmt.Errorf("no CSV file found in %s", zipPath)
+		if strings.HasSuffix(strings.ToLower(f.Name), ".xlsx") {
+			xlsxFile = f
+			break
+		}
 	}
 
-	// Извлекаем CSV
-	csvReader, err := csvFile.Open()
+	// Формируем путь для CSV
+	zipBase := filepath.Base(zipPath)             // Например, "20250502.zip"
+	zipBase = strings.TrimSuffix(zipBase, ".zip") // "20250502"
+	pathParts := strings.Split(zipPath, string(os.PathSeparator))
+	marketCode := "unknown"
+	for i, part := range pathParts {
+		if part == "BTCUSDT" && i+1 < len(pathParts) {
+			marketCode = pathParts[i+1] // "1" или "2"
+			break
+		}
+	}
+	csvFileName := fmt.Sprintf("%s_%s.csv", marketCode, zipBase)
+	csvPath := filepath.Join(tmpDir, csvFileName)
+
+	// Если CSV найден, извлекаем его
+	if csvFile != nil {
+		if err := extractFile(csvFile, csvPath); err != nil {
+			return fmt.Errorf("failed to extract CSV from %s: %w", zipPath, err)
+		}
+		log.Printf("Extracted CSV: %s", csvPath)
+	} else if xlsxFile != nil {
+		// Извлекаем XLSX
+		xlsxPath := filepath.Join(tmpDir, xlsxFile.Name)
+		if err := extractFile(xlsxFile, xlsxPath); err != nil {
+			return fmt.Errorf("failed to extract XLSX from %s: %w", zipPath, err)
+		}
+		// Конвертируем XLSX в CSV
+		if err := convertXLSXtoCSV(xlsxPath, csvPath); err != nil {
+			return fmt.Errorf("failed to convert XLSX to CSV for %s: %w", zipPath, err)
+		}
+		log.Printf("Converted XLSX to CSV: %s", csvPath)
+	} else {
+		return fmt.Errorf("no CSV file found in %s (and no XLSX to convert)", zipPath)
+	}
+
+	// Определяем тип данных по пути
+	isDepth := strings.Contains(strings.ToLower(zipPath), "/depth/")
+
+	// Обрабатываем CSV
+	if isDepth {
+		return db.processDepthCSV(zipPath, csvPath)
+	}
+	return db.processTradesCSV(zipPath, csvPath)
+}
+
+// extractFile извлекает файл из Zip в указанный путь.
+func extractFile(file *zip.File, destPath string) error {
+	fileReader, err := file.Open()
 	if err != nil {
-		return fmt.Errorf("failed to open CSV in %s: %w", zipPath, err)
+		return err
 	}
-	defer csvReader.Close()
+	defer fileReader.Close()
 
-	// Читаем CSV
-	reader := csv.NewReader(csvReader)
+	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+		return err
+	}
+
+	outFile, err := os.Create(destPath)
+	if err != nil {
+		return err
+	}
+	defer outFile.Close()
+
+	_, err = io.Copy(outFile, fileReader)
+	return err
+}
+
+// convertXLSXtoCSV конвертирует XLSX в CSV.
+func convertXLSXtoCSV(xlsxPath, csvPath string) error {
+	// Читаем XLSX в трёхмерный слайс
+	rows, err := xlsx.FileToSlice(xlsxPath)
+	if err != nil {
+		return fmt.Errorf("failed to read XLSX %s: %w", xlsxPath, err)
+	}
+	if len(rows) == 0 {
+		return fmt.Errorf("no sheets found in XLSX %s", xlsxPath)
+	}
+
+	// Берём первый лист
+	sheetRows := rows[0]
+	if len(sheetRows) == 0 {
+		return fmt.Errorf("no rows found in first sheet of XLSX %s", xlsxPath)
+	}
+
+	// Открываем CSV для записи
+	csvFile, err := os.Create(csvPath)
+	if err != nil {
+		return fmt.Errorf("failed to create CSV %s: %w", csvPath, err)
+	}
+	defer csvFile.Close()
+
+	writer := csv.NewWriter(csvFile)
+	defer writer.Flush()
+
+	// Пишем заголовок в зависимости от типа данных
+	isDepth := strings.Contains(strings.ToLower(xlsxPath), "depth")
+	var header []string
+	numColumns := 5
+	if isDepth {
+		header = []string{"timestamp", "ask_price", "bid_price", "ask_volume", "bid_volume"}
+	} else {
+		header = []string{"trade_id", "timestamp", "price", "side", "volume_quote", "size_base"}
+		numColumns = 6
+	}
+	if err := writer.Write(header); err != nil {
+		return fmt.Errorf("failed to write CSV header to %s: %w", csvPath, err)
+	}
+
+	// Обрабатываем строки (пропускаем заголовок)
+	for rowIdx, row := range sheetRows {
+		if rowIdx == 0 {
+			continue // Пропускаем заголовок
+		}
+
+		// Убедимся, что строка имеет достаточно столбцов
+		for len(row) < numColumns {
+			row = append(row, "")
+		}
+
+		// Подготавливаем запись
+		record := make([]string, numColumns)
+		for colIdx := 0; colIdx < numColumns; colIdx++ {
+			cellValue := strings.TrimSpace(row[colIdx])
+			// Исправляем числовые поля
+			if (isDepth && colIdx > 0) || (!isDepth && (colIdx == 2 || colIdx == 4 || colIdx == 5)) {
+				if strings.HasSuffix(cellValue, ".") {
+					cellValue += "0"
+				}
+				if cellValue == "" {
+					cellValue = "0.0"
+				}
+			}
+			record[colIdx] = cellValue
+		}
+
+		// Пропускаем пустые строки
+		if strings.Join(record, "") == "" {
+			continue
+		}
+
+		// Записываем строку в CSV
+		if err := writer.Write(record); err != nil {
+			log.Printf("Failed to write row %d to CSV %s: %v", rowIdx+1, csvPath, err)
+			continue
+		}
+	}
+
+	return nil
+}
+
+// processTradesCSV обрабатывает CSV для trades.
+func (db *DB) processTradesCSV(zipPath, csvPath string) error {
+	csvFile, err := os.Open(csvPath)
+	if err != nil {
+		return fmt.Errorf("failed to open CSV %s: %w", csvPath, err)
+	}
+	defer csvFile.Close()
+
+	reader := csv.NewReader(csvFile)
 	reader.FieldsPerRecord = -1 // Разрешить разное количество полей
 	records, err := reader.ReadAll()
 	if err != nil {
-		return fmt.Errorf("failed to read CSV in %s: %w", zipPath, err)
+		return fmt.Errorf("failed to read CSV %s: %w", csvPath, err)
 	}
 
-	// Подготавливаем транзакцию
+	log.Printf("Processed %d rows from CSV: %s", len(records)-1, csvPath)
+
 	tx, err := db.conn.Begin()
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction in %s: %w", db.path, err)
@@ -163,7 +327,6 @@ func (db *DB) processSingleZip(zipPath, tmpDir string) error {
 	}
 	defer stmt.Close()
 
-	// Конвертируем и вставляем записи
 	for i, record := range records {
 		if i == 0 {
 			continue // Пропускаем заголовок
@@ -173,14 +336,12 @@ func (db *DB) processSingleZip(zipPath, tmpDir string) error {
 			continue
 		}
 
-		// trade_id: TEXT
 		tradeID := strings.TrimSpace(record[0])
 		if tradeID == "" {
 			log.Printf("Skipping record in %s at line %d: empty trade_id", zipPath, i+1)
 			continue
 		}
 
-		// timestamp: INTEGER (Unix ms from CSV)
 		timestampStr := strings.TrimSpace(record[1])
 		timestamp, err := strconv.ParseInt(timestampStr, 10, 64)
 		if err != nil {
@@ -188,7 +349,6 @@ func (db *DB) processSingleZip(zipPath, tmpDir string) error {
 			continue
 		}
 
-		// price: REAL
 		priceStr := strings.TrimSpace(record[2])
 		price, err := strconv.ParseFloat(priceStr, 64)
 		if err != nil {
@@ -196,14 +356,12 @@ func (db *DB) processSingleZip(zipPath, tmpDir string) error {
 			continue
 		}
 
-		// side: TEXT (buy/sell)
 		side := strings.TrimSpace(record[3])
 		if side != "buy" && side != "sell" {
 			log.Printf("Skipping record in %s at line %d: invalid side %s", zipPath, i+1, side)
 			continue
 		}
 
-		// volume_quote: REAL (маппинг volume(quote) из CSV)
 		volumeQuoteStr := strings.TrimSpace(record[4])
 		volumeQuote, err := strconv.ParseFloat(volumeQuoteStr, 64)
 		if err != nil {
@@ -211,7 +369,6 @@ func (db *DB) processSingleZip(zipPath, tmpDir string) error {
 			continue
 		}
 
-		// size_base: REAL (маппинг size(base) из CSV)
 		sizeBaseStr := strings.TrimSpace(record[5])
 		sizeBase, err := strconv.ParseFloat(sizeBaseStr, 64)
 		if err != nil {
@@ -219,7 +376,6 @@ func (db *DB) processSingleZip(zipPath, tmpDir string) error {
 			continue
 		}
 
-		// Вставляем запись
 		_, err = stmt.Exec(tradeID, timestamp, price, side, volumeQuote, sizeBase)
 		if err != nil {
 			log.Printf("Failed to insert record in %s at line %d: %v", zipPath, i+1, err)
@@ -227,11 +383,97 @@ func (db *DB) processSingleZip(zipPath, tmpDir string) error {
 		}
 	}
 
-	// Завершаем транзакцию
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit transaction in %s: %w", db.path, err)
 	}
 
-	log.Printf("Successfully processed %s into %s", zipPath, db.path)
+	log.Printf("Successfully processed trades CSV from %s into %s", zipPath, db.path)
+	return nil
+}
+
+// processDepthCSV обрабатывает CSV для depth.
+func (db *DB) processDepthCSV(zipPath, csvPath string) error {
+	csvFile, err := os.Open(csvPath)
+	if err != nil {
+		return fmt.Errorf("failed to open CSV %s: %w", csvPath, err)
+	}
+	defer csvFile.Close()
+
+	reader := csv.NewReader(csvFile)
+	reader.FieldsPerRecord = -1 // Разрешить разное количество полей
+	records, err := reader.ReadAll()
+	if err != nil {
+		return fmt.Errorf("failed to read CSV %s: %w", csvPath, err)
+	}
+
+	log.Printf("Processed %d rows from CSV: %s", len(records)-1, csvPath)
+
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction in %s: %w", db.path, err)
+	}
+	stmt, err := tx.Prepare("INSERT OR IGNORE INTO depth (timestamp, ask_price, bid_price, ask_volume, bid_volume) VALUES (?, ?, ?, ?, ?)")
+	if err != nil {
+		tx.Rollback()
+		return fmt.Errorf("failed to prepare statement in %s: %w", db.path, err)
+	}
+	defer stmt.Close()
+
+	for i, record := range records {
+		if i == 0 {
+			continue // Пропускаем заголовок
+		}
+
+		for len(record) < 5 {
+			record = append(record, "0.0")
+		}
+
+		timestampStr := strings.TrimSpace(record[0])
+		timestamp, err := strconv.ParseInt(timestampStr, 10, 64)
+		if err != nil {
+			log.Printf("Skipping record in %s at line %d: invalid timestamp %s: %v", zipPath, i+1, timestampStr, record)
+			continue
+		}
+
+		askPriceStr := strings.TrimSpace(record[1])
+		askPrice, err := strconv.ParseFloat(askPriceStr, 64)
+		if err != nil {
+			log.Printf("Skipping record in %s at line %d: invalid ask_price %s: %v", zipPath, i+1, askPriceStr, record)
+			continue
+		}
+
+		bidPriceStr := strings.TrimSpace(record[2])
+		bidPrice, err := strconv.ParseFloat(bidPriceStr, 64)
+		if err != nil {
+			log.Printf("Skipping record in %s at line %d: invalid bid_price %s: %v", zipPath, i+1, bidPriceStr, record)
+			continue
+		}
+
+		askVolumeStr := strings.TrimSpace(record[3])
+		askVolume, err := strconv.ParseFloat(askVolumeStr, 64)
+		if err != nil {
+			log.Printf("Skipping record in %s at line %d: invalid ask_volume %s: %v", zipPath, i+1, askVolumeStr, record)
+			continue
+		}
+
+		bidVolumeStr := strings.TrimSpace(record[4])
+		bidVolume, err := strconv.ParseFloat(bidVolumeStr, 64)
+		if err != nil {
+			log.Printf("Skipping record in %s at line %d: invalid bid_volume %s: %v", zipPath, i+1, bidVolumeStr, record)
+			continue
+		}
+
+		_, err = stmt.Exec(timestamp, askPrice, bidPrice, askVolume, bidVolume)
+		if err != nil {
+			log.Printf("Failed to insert record in %s at line %d: %v", zipPath, i+1, err)
+			continue
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction in %s: %w", db.path, err)
+	}
+
+	log.Printf("Successfully processed depth CSV from %s into %s", zipPath, db.path)
 	return nil
 }
