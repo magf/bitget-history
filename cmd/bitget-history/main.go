@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/magf/bitget-history/internal/db"
 	"github.com/magf/bitget-history/internal/downloader"
 	"github.com/magf/bitget-history/internal/proxymanager"
 	"golang.org/x/net/proxy"
@@ -138,6 +139,12 @@ func main() {
 		}
 	}
 
+	// Проверяем путь к базе
+	if cfg.Database.Path == "" || strings.Contains(cfg.Database.Path, "%s") {
+		log.Fatalf("Error: invalid database path in config: %s", cfg.Database.Path)
+	}
+	log.Printf("Using database path from config: %s", cfg.Database.Path)
+
 	// Создаём ProxyManager
 	timeout := time.Duration(*timeoutFlag) * time.Second
 	pm, err := proxymanager.NewProxyManager(cfg.Proxy.RawFile, cfg.Proxy.WorkingFile, cfg.Proxy.Fallback, cfg.Proxy.Username, cfg.Proxy.Password, timeout)
@@ -177,7 +184,28 @@ func main() {
 		log.Fatalf("Failed to download files: %v", err)
 	}
 
-	log.Println("Download completed successfully")
+	// Создаём DB
+	dbInstance, err := db.NewDB(cfg.Database.Path)
+	if err != nil {
+		log.Fatalf("Failed to create database: %v", err)
+	}
+	defer dbInstance.Close()
+
+	// Собираем пути к Zip-файлам
+	var zipFiles []string
+	for _, fileInfo := range urls {
+		relativePath := strings.TrimPrefix(fileInfo.URL, cfg.Downloader.BaseURL+"/")
+		zipPath := filepath.Join(outputDir, relativePath)
+		zipFiles = append(zipFiles, zipPath)
+	}
+
+	// Обрабатываем Zip-файлы и выгружаем в базу
+	log.Println("Processing and uploading files to database...")
+	if err := dbInstance.ProcessZipFiles(zipFiles); err != nil {
+		log.Fatalf("Failed to process zip files: %v", err)
+	}
+
+	log.Println("Processing completed successfully")
 	os.Exit(0)
 }
 

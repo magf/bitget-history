@@ -114,11 +114,13 @@ create_config() {
         cat > "$CONFIG_DIR/config.yaml" <<EOF
 # Конфигурация Bitget History Downloader
 proxy:
-  raw_file: "data/proxies_raw.txt"
-  working_file: "data/proxies.txt"
-  fallback: "socks5://1.2.3.4:1080"
+  raw_file: "/var/lib/bitget-history/proxies.txt"
+  working_file: "/var/lib/bitget-history/working_proxies.txt"
+  fallback: ""
+  username: ""
+  password: ""
 database:
-  path: "/var/lib/bitget-history/history_%s_%s.db"
+  path: "/var/lib/bitget-history/bitget.db"
 downloader:
   base_url: "https://img.bitgetimg.com/online"
   user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
