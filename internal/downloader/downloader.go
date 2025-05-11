@@ -30,6 +30,12 @@ type Downloader struct {
 	maxRetries int
 }
 
+// FileInfo хранит информацию о файле.
+type FileInfo struct {
+	URL           string
+	ContentLength int64
+}
+
 // NewDownloader создаёт новый загрузчик.
 func NewDownloader(baseURL, userAgent, outputDir string, proxyMgr *proxymanager.ProxyManager) (*Downloader, error) {
 	return &Downloader{
@@ -37,24 +43,34 @@ func NewDownloader(baseURL, userAgent, outputDir string, proxyMgr *proxymanager.
 		userAgent:  userAgent,
 		outputDir:  outputDir,
 		proxyMgr:   proxyMgr,
-		maxRetries: 10,
+		maxRetries: 5,
 	}, nil
 }
 
 // DownloadFiles загружает файлы по списку URL-ов.
-func (d *Downloader) DownloadFiles(ctx context.Context, urls []string) error {
-	log.Printf("Starting download of %d files", len(urls))
+func (d *Downloader) DownloadFiles(ctx context.Context, files []FileInfo) error {
+	log.Printf("Starting download of %d files", len(files))
 	var wg sync.WaitGroup
-	errChan := make(chan error, len(urls))
+	errChan := make(chan error, len(files))
 	failedURLs := make([]string, 0)
 	var mu sync.Mutex
 	badProxies := make(map[string]struct{}) // Кэш нерабочих прокси
 
-	for i, url := range urls {
+	for i, file := range files {
 		wg.Add(1)
-		go func(i int, url string) {
+		go func(i int, file FileInfo) {
 			defer wg.Done()
-			log.Printf("Downloading file %d: %s", i+1, url)
+			// Проверяем, существует ли файл и совпадает ли размер
+			relativePath := strings.TrimPrefix(file.URL, d.baseURL+"/")
+			outputPath := filepath.Join(d.outputDir, relativePath)
+			if file.ContentLength > 0 {
+				if stat, err := os.Stat(outputPath); err == nil && stat.Size() == file.ContentLength {
+					log.Printf("Skipping %s: file exists with correct size %d", file.URL, file.ContentLength)
+					return
+				}
+			}
+
+			log.Printf("Downloading file %d: %s", i+1, file.URL)
 			for attempt := 1; attempt <= d.maxRetries; attempt++ {
 				proxies, err := d.proxyMgr.GetProxies()
 				if err != nil {
@@ -76,23 +92,23 @@ func (d *Downloader) DownloadFiles(ctx context.Context, urls []string) error {
 					}
 				}
 				if len(availableProxies) == 0 {
-					log.Printf("All proxies marked as bad for %s", url)
+					log.Printf("All proxies marked as bad for %s", file.URL)
 					mu.Lock()
-					failedURLs = append(failedURLs, url)
+					failedURLs = append(failedURLs, file.URL)
 					mu.Unlock()
-					errChan <- fmt.Errorf("no good proxies left for %s", url)
+					errChan <- fmt.Errorf("no good proxies left for %s", file.URL)
 					return
 				}
 
 				proxyIndex := rand.Intn(len(availableProxies))
 				proxyURL := availableProxies[proxyIndex]
-				log.Printf("Attempt %d/%d for %s using proxy %s", attempt, d.maxRetries, url, proxyURL)
+				log.Printf("Attempt %d/%d for %s using proxy %s", attempt, d.maxRetries, file.URL, proxyURL)
 
-				err = d.downloadWithProxy(ctx, url, proxyURL)
+				err = d.downloadWithProxy(ctx, file.URL, proxyURL)
 				if err == nil {
 					return
 				}
-				log.Printf("Failed attempt %d for %s with proxy %s: %v", attempt, url, proxyURL, err)
+				log.Printf("Failed attempt %d for %s with proxy %s: %v", attempt, file.URL, proxyURL, err)
 				// Помечаем прокси как нерабочий при определённых ошибках
 				if strings.Contains(err.Error(), "connection refused") || strings.Contains(err.Error(), "timeout") {
 					badProxies[proxyURL] = struct{}{}
@@ -101,10 +117,10 @@ func (d *Downloader) DownloadFiles(ctx context.Context, urls []string) error {
 				time.Sleep(time.Second * time.Duration(attempt))
 			}
 			mu.Lock()
-			failedURLs = append(failedURLs, url)
+			failedURLs = append(failedURLs, file.URL)
 			mu.Unlock()
-			errChan <- fmt.Errorf("failed to download %s after %d attempts", url, d.maxRetries)
-		}(i, url)
+			errChan <- fmt.Errorf("failed to download %s after %d attempts", file.URL, d.maxRetries)
+		}(i, file)
 	}
 
 	wg.Wait()

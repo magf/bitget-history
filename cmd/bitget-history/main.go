@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -181,8 +182,8 @@ func main() {
 }
 
 // generateURLs генерирует список URL-ов на основе параметров.
-func generateURLs(baseURL, market, pair, dataType string, startDate, endDate time.Time, debug bool, proxies []string, userAgent string) ([]string, error) {
-	var urls []string
+func generateURLs(baseURL, market, pair, dataType string, startDate, endDate time.Time, debug bool, proxies []string, userAgent string) ([]downloader.FileInfo, error) {
+	var urls []downloader.FileInfo
 	days := int(endDate.Sub(startDate).Hours()/24) + 1
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -213,7 +214,7 @@ func generateURLs(baseURL, market, pair, dataType string, startDate, endDate tim
 					wg.Add(1)
 					go func(url string) {
 						defer wg.Done()
-						exists, err := checkFileExists(url, proxies, userAgent, debug)
+						exists, contentLength, err := checkFileExists(url, proxies, userAgent, debug)
 						if err != nil {
 							if debug {
 								log.Printf("Error checking %s: %v", url, err)
@@ -230,10 +231,10 @@ func generateURLs(baseURL, market, pair, dataType string, startDate, endDate tim
 							return
 						}
 						mu.Lock()
-						urls = append(urls, url)
+						urls = append(urls, downloader.FileInfo{URL: url, ContentLength: contentLength})
 						mu.Unlock()
 						if debug {
-							log.Printf("Generated URL: %s", url)
+							log.Printf("Generated URL: %s (Content-Length: %d)", url, contentLength)
 						}
 					}(url)
 				}
@@ -253,7 +254,7 @@ func generateURLs(baseURL, market, pair, dataType string, startDate, endDate tim
 				wg.Add(1)
 				go func(url string) {
 					defer wg.Done()
-					exists, err := checkFileExists(url, proxies, userAgent, debug)
+					exists, contentLength, err := checkFileExists(url, proxies, userAgent, debug)
 					if err != nil {
 						if debug {
 							log.Printf("Error checking %s: %v", url, err)
@@ -267,10 +268,10 @@ func generateURLs(baseURL, market, pair, dataType string, startDate, endDate tim
 						return
 					}
 					mu.Lock()
-					urls = append(urls, url)
+					urls = append(urls, downloader.FileInfo{URL: url, ContentLength: contentLength})
 					mu.Unlock()
 					if debug {
-						log.Printf("Generated URL: %s", url)
+						log.Printf("Generated URL: %s (Content-Length: %d)", url, contentLength)
 					}
 				}(url)
 			}
@@ -292,8 +293,8 @@ func generateURLs(baseURL, market, pair, dataType string, startDate, endDate tim
 	return urls, nil
 }
 
-// checkFileExists проверяет существование файла через HEAD-запрос.
-func checkFileExists(urlStr string, proxies []string, userAgent string, debug bool) (bool, error) {
+// checkFileExists проверяет существование файла через HEAD-запрос и возвращает Content-Length.
+func checkFileExists(urlStr string, proxies []string, userAgent string, debug bool) (bool, int64, error) {
 	maxAttempts := 3
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
@@ -343,22 +344,24 @@ func checkFileExists(urlStr string, proxies []string, userAgent string, debug bo
 			lastErr = err
 			continue
 		}
-		resp.Body.Close()
+		defer resp.Body.Close()
 
 		if debug {
 			log.Printf("Checked %s with proxy %s: status %d", urlStr, proxyURLStr, resp.StatusCode)
 		}
 		// Явно считаем файл существующим только при 200-399, иначе прерываем при 400+
 		if resp.StatusCode >= 200 && resp.StatusCode < 400 {
-			return true, nil
+			contentLengthStr := resp.Header.Get("Content-Length")
+			contentLength, _ := strconv.ParseInt(contentLengthStr, 10, 64) // Игнорируем ошибку, если заголовок отсутствует
+			return true, contentLength, nil
 		} else if resp.StatusCode >= 400 {
-			return false, nil
+			return false, 0, nil
 		}
 	}
 	if debug {
 		log.Printf("File %s skipped after %d attempts due to error: %v", urlStr, maxAttempts, lastErr)
 	}
-	return false, fmt.Errorf("failed to check %s after %d attempts: %v", urlStr, maxAttempts, lastErr)
+	return false, 0, fmt.Errorf("failed to check %s after %d attempts: %v", urlStr, maxAttempts, lastErr)
 }
 
 // readProxyCount читает количество прокси из файла.
