@@ -24,7 +24,7 @@ import (
 	"golang.org/x/net/proxy"
 	"gopkg.in/yaml.v3"
 
-	_ "github.com/bdandy/go-socks4" // Поддержка SOCKS4
+	_ "github.com/bdandy/go-socks4"
 )
 
 // Config представляет структуру конфигурационного файла.
@@ -157,12 +157,8 @@ func main() {
 		log.Fatalf("Failed to create proxy manager: %v", err)
 	}
 
-	// Создаём Downloader
-	outputDir := "/var/lib/bitget-history/offline"
-	dl, err := downloader.NewDownloader(cfg.Downloader.BaseURL, cfg.Downloader.UserAgent, outputDir, pm)
-	if err != nil {
-		log.Fatalf("Failed to create downloader: %v", err)
-	}
+	// Инициализируем список прокси
+	var proxies []string
 
 	// Проверяем --repeat
 	if *repeatFlag && (*typeFlag != "depth" || !*skipIfExistsFlag) {
@@ -170,20 +166,37 @@ func main() {
 		*repeatFlag = false
 	}
 
+	// Создаём Downloader
+	outputDir := "/var/lib/bitget-history/offline"
+	dl, err := downloader.NewDownloader(cfg.Downloader.BaseURL, cfg.Downloader.UserAgent, outputDir, pm)
+	if err != nil {
+		log.Fatalf("Failed to create downloader: %v", err)
+	}
+
 	// Основной цикл
 	for {
 		// Проверяем прокси
 		log.Println("Ensuring proxies...")
 		if err := pm.EnsureProxies(context.Background()); err != nil {
-			log.Fatalf("Failed to ensure proxies: %v", err)
+			log.Printf("Warning: failed to ensure proxies: %v", err)
+			if len(proxies) == 0 {
+				log.Fatalf("No proxies available to continue")
+			}
+			log.Println("Continuing with last known proxies")
+		} else {
+			proxies, err = pm.GetProxies()
+			if err != nil {
+				log.Printf("Warning: failed to get proxies: %v", err)
+				if len(proxies) == 0 {
+					log.Fatalf("No proxies available to continue")
+				}
+				log.Println("Continuing with last known proxies")
+			} else if len(proxies) == 0 {
+				log.Fatalf("No working proxies found")
+			} else {
+				log.Printf("Found %d working proxies", len(proxies))
+			}
 		}
-
-		// Получаем рабочие прокси
-		proxies, err := pm.GetProxies()
-		if err != nil {
-			log.Fatalf("Failed to get proxies: %v", err)
-		}
-		log.Printf("Found %d working proxies", len(proxies))
 
 		// Генерируем URL-ы
 		urls, err := generateURLs(cfg.Downloader.BaseURL, *marketFlag, *pairFlag, *typeFlag, startDate, endDate, *debugFlag, *skipIfExistsFlag, proxies, cfg.Downloader.UserAgent, outputDir)
@@ -208,29 +221,8 @@ func main() {
 		baseURLPrefix := strings.TrimSuffix(cfg.Downloader.BaseURL, "/") + "/"
 		log.Printf("Using baseURLPrefix for trimming: %s", baseURLPrefix)
 
-		if *typeFlag == "depth" {
-			// Для depth одна база: depth/<pair>.db
-			dbPath := filepath.Join(cfg.Database.Path, "depth", *pairFlag+".db")
-			var depthFiles []string
-			for _, fileInfo := range urls {
-				relativePath := strings.TrimPrefix(fileInfo.URL, baseURLPrefix)
-				zipPath := filepath.Join(outputDir, relativePath)
-				if *debugFlag {
-					log.Printf("Processing URL: %s, relativePath: %s, zipPath: %s", fileInfo.URL, relativePath, zipPath)
-				}
-				if strings.Contains(strings.ToLower(relativePath), "depth/") {
-					depthFiles = append(depthFiles, zipPath)
-				}
-			}
-			if len(depthFiles) > 0 {
-				sort.Strings(depthFiles)
-				log.Printf("Adding depth group: dbPath=%s, files=%v", dbPath, depthFiles)
-				zipGroups = append(zipGroups, ZipGroup{dbPath: dbPath, files: depthFiles})
-			} else {
-				log.Printf("No depth files found for %s", dbPath)
-			}
-		} else if *typeFlag == "trades" {
-			// Для trades две базы: trades/SPBL/<pair>.db и trades/UMCBL/<pair>.db
+		// Обрабатываем только trades внутри цикла
+		if *typeFlag == "trades" {
 			spblFiles := make([]string, 0)
 			umcblFiles := make([]string, 0)
 			for _, fileInfo := range urls {
@@ -247,7 +239,6 @@ func main() {
 					}
 				}
 			}
-			// Добавляем группы, если файлы есть
 			if (*marketFlag == "spot" || *marketFlag == "all") && len(spblFiles) > 0 {
 				dbPath := filepath.Join(cfg.Database.Path, "trades", "SPBL", *pairFlag+".db")
 				sort.Strings(spblFiles)
@@ -265,25 +256,21 @@ func main() {
 			}
 		}
 
-		// Обрабатываем каждую группу
+		// Обрабатываем trades
 		for _, group := range zipGroups {
 			log.Printf("Processing database: %s with %d zip files", group.dbPath, len(group.files))
-			// Создаём каталог для базы
 			if err := os.MkdirAll(filepath.Dir(group.dbPath), 0755); err != nil {
 				log.Printf("Failed to create directory for %s: %v", group.dbPath, err)
 				continue
 			}
-			// Создаём DB
 			dbInstance, err := db.NewDB(group.dbPath, *typeFlag)
 			if err != nil {
 				log.Printf("Failed to create database %s: %v", group.dbPath, err)
 				continue
 			}
-			// Обрабатываем файлы
 			if err := dbInstance.ProcessZipFiles(group.files); err != nil {
 				log.Printf("Failed to process zip files for %s: %v", group.dbPath, err)
 			}
-			// Закрываем базу
 			if err := dbInstance.Close(); err != nil {
 				log.Printf("Failed to close database %s: %v", group.dbPath, err)
 			}
@@ -298,24 +285,65 @@ func main() {
 		}
 
 		log.Printf("Repeat cycle: %d URLs remaining, continuing...", len(urls))
+	}
 
-		log.Println("Processing completed successfully")
+	// Финальная обработка для depth
+	if *typeFlag == "depth" {
+		dbPath := filepath.Join(cfg.Database.Path, "depth", *pairFlag+".db")
+		var depthFiles []string
 
-		// Явный чекпоинт перед завершением
-		for _, group := range zipGroups {
-			dbInstance, err := db.NewDB(group.dbPath, *typeFlag)
+		// Собираем все ZIP-файлы из директорий spot (1) и futures (2)
+		marketCodes := []string{"1"} // spot
+		if *marketFlag == "futures" {
+			marketCodes = []string{"2"}
+		} else if *marketFlag == "all" {
+			marketCodes = []string{"1", "2"}
+		}
+
+		for _, marketCode := range marketCodes {
+			dir := filepath.Join(outputDir, "depth", *pairFlag, marketCode)
+			err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+				if err != nil {
+					return err
+				}
+				if !info.IsDir() && strings.HasSuffix(info.Name(), ".zip") {
+					depthFiles = append(depthFiles, path)
+				}
+				return nil
+			})
 			if err != nil {
-				log.Printf("Failed to reopen database %s for checkpoint: %v", group.dbPath, err)
-				continue
-			}
-			err = dbInstance.Close()
-			if err != nil {
-				log.Printf("Failed to perform final WAL checkpoint for %s: %v", group.dbPath, err)
-			} else {
-				log.Printf("Final WAL checkpoint successful for %s", group.dbPath)
+				log.Printf("Failed to walk directory %s: %v", dir, err)
 			}
 		}
+
+		if len(depthFiles) > 0 {
+			// Сортируем файлы в алфавитном порядке
+			sort.Strings(depthFiles)
+			log.Printf("Processing depth database: %s with %d zip files", dbPath, len(depthFiles))
+
+			// Создаём директорию для базы
+			if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
+				log.Printf("Failed to create directory for %s: %v", dbPath, err)
+			} else {
+				// Обрабатываем базу
+				dbInstance, err := db.NewDB(dbPath, *typeFlag)
+				if err != nil {
+					log.Printf("Failed to create database %s: %v", dbPath, err)
+				} else {
+					if err := dbInstance.ProcessZipFiles(depthFiles); err != nil {
+						log.Printf("Failed to process zip files for %s: %v", dbPath, err)
+					}
+					if err := dbInstance.Close(); err != nil {
+						log.Printf("Failed to close database %s: %v", dbPath, err)
+					}
+				}
+			}
+		} else {
+			log.Printf("No depth files found for %s", dbPath)
+		}
 	}
+
+	log.Println("Processing completed successfully")
 }
 
 // generateURLs генерирует список URL-ов на основе параметров.
