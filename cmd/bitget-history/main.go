@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -15,6 +16,8 @@ import (
 	"github.com/magf/bitget-history/internal/db"
 	"github.com/magf/bitget-history/internal/downloader"
 	"github.com/magf/bitget-history/internal/proxymanager"
+	"github.com/magf/bitget-history/internal/server/backend"
+	"github.com/magf/bitget-history/internal/server/web"
 	"gopkg.in/yaml.v3"
 )
 
@@ -41,6 +44,7 @@ type Config struct {
 func main() {
 	// Парсим флаги
 	helpFlag := flag.Bool("help", false, "Show help message")
+	serverFlag := flag.Bool("server", false, "Run server")
 	pairFlag := flag.String("pair", "BTCUSDT", "Trading pair (e.g., BTCUSDT)")
 	typeFlag := flag.String("type", "", "Data type: trades or depth")
 	marketFlag := flag.String("market", "all", "Market type: spot, futures or all")
@@ -71,6 +75,18 @@ func main() {
 		return
 	}
 
+	// Run server
+	if *serverFlag {
+		// Настраиваем единый сервер
+		mux := http.NewServeMux()
+		backend.StartServer(mux)
+		web.StartServer(mux)
+		log.Println("Server running on http://localhost:8080")
+		if err := http.ListenAndServe(":8080", mux); err != nil {
+			log.Fatalf("Server failed: %v", err)
+		}
+		return
+	}
 	// Проверяем обязательный флаг --type
 	if *typeFlag == "" {
 		log.Fatal("Error: --type (-t) is required (trades or depth)")

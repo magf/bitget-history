@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Bitget Depth Chart</title>
+    <script src="/d3.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .chart-container { width: 100%; max-width: 1200px; }
+        .axis path, .axis line { stroke: #000; }
+        .axis text { font-size: 12px; }
+        .line-ask { stroke: #ff4500; stroke-width: 2; fill: none; }
+        .line-bid { stroke: #00b7eb; stroke-width: 2; fill: none; }
+        .bar-ask { fill: #ff4500; opacity: 0.5; }
+        .bar-bid { fill: #00b7eb; opacity: 0.5; }
+        .controls { margin-bottom: 20px; }
+        .error { color: red; }
+    </style>
+</head>
+<body>
+    <div class="controls">
+        <label>Start (Unix s): <input type="number" id="startTime" value="1746108746"></label>
+        <label>End (Unix s): <input type="number" id="endTime" value="1746108747"></label>
+        <label>Table: <select id="table">
+            <option value="1">Spot</option>
+            <option value="2" selected>Futures</option>
+        </select></label>
+        <button onclick="updateChart()">Update</button>
+    </div>
+    <div id="error" class="error"></div>
+    <div class="chart-container">
+        <svg id="chart"></svg>
+    </div>
+
+    <script>
+        const svg = d3.select("#chart");
+        const errorDiv = d3.select("#error");
+        const margin = { top: 20, right: 30, bottom: 100, left: 50 };
+        const width = 1200 - margin.left - margin.right;
+        const height = 600 - margin.top - margin.bottom;
+        const priceHeight = height * 0.7;
+        const volumeHeight = height * 0.3;
+
+        const g = svg.append("g")
+            .attr("transform", `translate(${margin.left},${margin.top})`);
+
+        const x = d3.scaleTime().range([0, width]);
+        const yPrice = d3.scaleLinear().range([priceHeight, 0]);
+        const yVolume = d3.scaleLinear().range([volumeHeight, 0]);
+
+        const xAxis = g.append("g")
+            .attr("class", "axis x-axis")
+            .attr("transform", `translate(0,${priceHeight})`);
+        const yPriceAxis = g.append("g")
+            .attr("class", "axis y-price-axis");
+        const yVolumeAxis = g.append("g")
+            .attr("class", "axis y-volume-axis")
+            .attr("transform", `translate(0,${priceHeight + 20})`);
+
+        const lineAsk = d3.line()
+            .x(d => x(new Date(d.timestamp * 1000)))
+            .y(d => yPrice(d.ask_price));
+        const lineBid = d3.line()
+            .x(d => x(new Date(d.timestamp * 1000)))
+            .y(d => yPrice(d.bid_price));
+
+        const pathAsk = g.append("path")
+            .attr("class", "line-ask");
+        const pathBid = g.append("path")
+            .attr("class", "line-bid");
+
+        const zoom = d3.zoom()
+            .scaleExtent([0.1, 100])
+            .translateExtent([[0, 0], [width, height]])
+            .on("zoom", zoomed);
+
+        svg.call(zoom);
+
+        let data = [];
+
+        function zoomed(event) {
+            const transform = event.transform;
+            const newX = transform.rescaleX(x);
+
+            xAxis.call(d3.axisBottom(newX));
+
+            const [xMin, xMax] = newX.domain();
+            const visibleData = data.filter(d => {
+                const t = new Date(d.timestamp * 1000);
+                return t >= xMin && t <= xMax;
+            });
+
+            yPrice.domain([
+                d3.min(visibleData, d => Math.min(d.ask_price, d.bid_price)) || 0,
+                d3.max(visibleData, d => Math.max(d.ask_price, d.bid_price)) || 1
+            ]);
+            yVolume.domain([0, d3.max(visibleData, d => Math.max(d.ask_volume, d.bid_volume)) || 1]);
+
+            yPriceAxis.call(d3.axisLeft(yPrice));
+            yVolumeAxis.call(d3.axisLeft(yVolume));
+
+            pathAsk.attr("d", lineAsk.x(d => newX(new Date(d.timestamp * 1000))));
+            pathBid.attr("d", lineBid.x(d => newX(new Date(d.timestamp * 1000))));
+
+            const barWidth = width / data.length / 2;
+            g.selectAll(".bar-ask")
+                .attr("x", d => newX(new Date(d.timestamp * 1000)))
+                .attr("y", d => yVolume(d.ask_volume))
+                .attr("height", d => volumeHeight - yVolume(d.ask_volume));
+            g.selectAll(".bar-bid")
+                .attr("x", d => newX(new Date(d.timestamp * 1000)) + barWidth / 2)
+                .attr("y", d => yVolume(d.bid_volume))
+                .attr("height", d => volumeHeight - yVolume(d.bid_volume));
+        }
+
+        function updateChart() {
+            const startTime = document.getElementById("startTime").value;
+            const endTime = document.getElementById("endTime").value;
+            const table = document.getElementById("table").value;
+
+            if (!startTime || !endTime || isNaN(startTime) || isNaN(endTime)) {
+                errorDiv.text("Please enter valid start and end timestamps");
+                return;
+            }
+
+            const url = `/depth?start=${startTime}&end=${endTime}&table=${table}`;
+            console.log("Fetching data from:", url);
+
+            d3.json(url).then(newData => {
+                errorDiv.text("");
+                if (!Array.isArray(newData) || newData.length === 0) {
+                    errorDiv.text("No data returned from server");
+                    return;
+                }
+
+                g.selectAll(".bar-ask").remove();
+                g.selectAll(".bar-bid").remove();
+
+                data = newData;
+
+                x.domain(d3.extent(data, d => new Date(d.timestamp * 1000)));
+                yPrice.domain([
+                    d3.min(data, d => Math.min(d.ask_price, d.bid_price)) || 0,
+                    d3.max(data, d => Math.max(d.ask_price, d.bid_price)) || 1
+                ]);
+                yVolume.domain([0, d3.max(data, d => Math.max(d.ask_volume, d.bid_volume)) || 1]);
+
+                xAxis.call(d3.axisBottom(x));
+                yPriceAxis.call(d3.axisLeft(yPrice));
+                yVolumeAxis.call(d3.axisLeft(yVolume));
+
+                pathAsk.datum(data).attr("d", lineAsk);
+                pathBid.datum(data).attr("d", lineBid);
+
+                const barWidth = width / data.length / 2;
+                g.selectAll(".bar-ask")
+                    .data(data)
+                    .enter()
+                    .append("rect")
+                    .attr("class", "bar-ask")
+                    .attr("x", d => x(new Date(d.timestamp * 1000)))
+                    .attr("y", d => yVolume(d.ask_volume))
+                    .attr("width", barWidth)
+                    .attr("height", d => volumeHeight - yVolume(d.ask_volume));
+                g.selectAll(".bar-bid")
+                    .data(data)
+                    .enter()
+                    .append("rect")
+                    .attr("class", "bar-bid")
+                    .attr("x", d => x(new Date(d.timestamp * 1000)) + barWidth / 2)
+                    .attr("y", d => yVolume(d.bid_volume))
+                    .attr("width", barWidth)
+                    .attr("height", d => volumeHeight - yVolume(d.bid_volume));
+
+                svg.call(zoom.transform, d3.zoomIdentity);
+            }).catch(err => {
+                console.error("Failed to load data:", err);
+                errorDiv.text(`Failed to load data: ${err.message}`);
+            });
+        }
+
+        svg.attr("width", width + margin.left + margin.right)
+           .attr("height", height + margin.top + margin.bottom);
+        updateChart();
+    </script>
+</body>
+</html>
