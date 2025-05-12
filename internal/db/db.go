@@ -146,7 +146,7 @@ func (db *DB) Close() error {
 }
 
 // ProcessZipFiles обрабатывает Zip-файлы и выгружает данные в SQLite.
-func (db *DB) ProcessZipFiles(zipFiles []string) error {
+func (db *DB) ProcessZipFiles(zipFiles []string, debug bool) error {
 	tmpDir := "/tmp/bitget-history"
 	// Очищаем /tmp/bitget-history перед началом
 	log.Printf("Cleaning temporary directory: %s", tmpDir)
@@ -238,6 +238,18 @@ func (db *DB) ProcessZipFiles(zipFiles []string) error {
 	}
 
 	for _, zipPath := range zipFiles {
+		// Проверяем размер файла
+		fileInfo, err := os.Stat(zipPath)
+		if err != nil {
+			return fmt.Errorf("failed to stat file %s: %w", zipPath, err)
+		}
+		if fileInfo.Size() == 0 {
+			if debug {
+				log.Printf("Skipping empty file %s (0 bytes)", zipPath)
+			}
+			continue // Пропускаем пустой файл
+		}
+
 		log.Printf("Processing zip file: %s", zipPath)
 		if err := db.processSingleZip(zipPath, tmpDir); err != nil {
 			log.Printf("Failed to process %s: %v", zipPath, err)

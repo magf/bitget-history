@@ -210,6 +210,16 @@ func (d *Downloader) downloadWithProxy(ctx context.Context, fileURL, proxyURLStr
 
 // checkZipFile проверяет, является ли файл валидным Zip.
 func checkZipFile(path string) error {
+	// Проверяем размер файла
+	fileInfo, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("failed to stat file %s: %w", path, err)
+	}
+	if fileInfo.Size() == 0 {
+		log.Printf("Skipping empty file %s (0 bytes)", path)
+		return nil
+	}
+
 	r, err := zip.OpenReader(path)
 	if err != nil {
 		return err

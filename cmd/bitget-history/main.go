@@ -258,7 +258,7 @@ func main() {
 				log.Printf("Failed to create database %s: %v", group.dbPath, err)
 				continue
 			}
-			if err := dbInstance.ProcessZipFiles(group.files); err != nil {
+			if err := dbInstance.ProcessZipFiles(group.files, *debugFlag); err != nil {
 				log.Printf("Failed to process zip files for %s: %v", group.dbPath, err)
 			}
 			if err := dbInstance.Close(); err != nil {
@@ -320,7 +320,7 @@ func main() {
 				if err != nil {
 					log.Printf("Failed to create database %s: %v", dbPath, err)
 				} else {
-					if err := dbInstance.ProcessZipFiles(depthFiles); err != nil {
+					if err := dbInstance.ProcessZipFiles(depthFiles, *debugFlag); err != nil {
 						log.Printf("Failed to process zip files for %s: %v", dbPath, err)
 					}
 					if err := dbInstance.Close(); err != nil {

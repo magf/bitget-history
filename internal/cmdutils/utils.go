@@ -17,6 +17,7 @@ import (
 
 	"github.com/magf/bitget-history/internal/downloader"
 	"golang.org/x/net/proxy"
+	"gopkg.in/yaml.v3"
 )
 
 // GenerateURLs генерирует список URL-ов на основе параметров.
@@ -31,7 +32,7 @@ func GenerateURLs(baseURL, market, pair, dataType string, startDate, endDate tim
 		if market == "futures" {
 			marketCodes = []string{"UMCBL"}
 		} else if market == "all" {
-			marketCodes = []string{"SPBL", "UMCBL"} // Поддержка all
+			marketCodes = []string{"SPBL", "UMCBL"}
 		}
 		for _, marketCode := range marketCodes {
 			for d := startDate; !d.After(endDate); d = d.AddDate(0, 0, 1) {
@@ -43,19 +44,33 @@ func GenerateURLs(baseURL, market, pair, dataType string, startDate, endDate tim
 						endNum = 999
 					}
 					batchURLs := make([]string, 0, endNum-startNum+1)
+					batchPaths := make([]string, 0, endNum-startNum+1)
 					for num := startNum; num <= endNum; num++ {
 						path := fmt.Sprintf("trades/%s/%s/%s_%03d.zip", marketCode, pair, dateStr, num)
 						url := fmt.Sprintf("%s/%s", baseURL, path)
 						batchURLs = append(batchURLs, url)
+						batchPaths = append(batchPaths, path)
 					}
 
 					// Параллельная проверка пачки
 					stopBatch := false
-					for _, url := range batchURLs {
+					for i, url := range batchURLs {
 						wg.Add(1)
-						go func(url string) {
+						go func(url, path string) {
 							defer wg.Done()
-							exists, contentLength, err := CheckFileExists(url, proxies, userAgent, debug)
+
+							// Проверяем, существует ли файл локально, если установлен --skip-if-exists
+							if skipIfExists {
+								localPath := filepath.Join(outputDir, path)
+								if _, err := os.Stat(localPath); err == nil {
+									if debug {
+										log.Printf("Skipping %s: file already exists locally", url)
+									}
+									return
+								}
+							}
+
+							exists, contentLength, err := CheckFileExists(url, proxies, userAgent, debug, outputDir, dataType)
 							if err != nil {
 								if debug {
 									log.Printf("Error checking %s: %v", url, err)
@@ -77,7 +92,7 @@ func GenerateURLs(baseURL, market, pair, dataType string, startDate, endDate tim
 								log.Printf("Generated URL: %s (Content-Length: %d)", url, contentLength)
 							}
 							mu.Unlock()
-						}(url)
+						}(url, batchPaths[i])
 					}
 					wg.Wait()
 					if stopBatch {
@@ -114,7 +129,7 @@ func GenerateURLs(baseURL, market, pair, dataType string, startDate, endDate tim
 						}
 					}
 
-					exists, contentLength, err := CheckFileExists(url, proxies, userAgent, debug)
+					exists, contentLength, err := CheckFileExists(url, proxies, userAgent, debug, outputDir, dataType)
 					if err != nil {
 						if debug {
 							log.Printf("Error checking %s: %v", url, err)
@@ -155,7 +170,7 @@ func GenerateURLs(baseURL, market, pair, dataType string, startDate, endDate tim
 }
 
 // CheckFileExists проверяет существование файла через HEAD-запрос и возвращает Content-Length.
-func CheckFileExists(urlStr string, proxies []string, userAgent string, debug bool) (bool, int64, error) {
+func CheckFileExists(urlStr string, proxies []string, userAgent string, debug bool, outputDir, dataType string) (bool, int64, error) {
 	maxAttempts := 3
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
@@ -210,12 +225,32 @@ func CheckFileExists(urlStr string, proxies []string, userAgent string, debug bo
 		if debug {
 			log.Printf("Checked %s with proxy %s: status %d", urlStr, proxyURLStr, resp.StatusCode)
 		}
-		// Явно считаем файл существующим только при 200-399, иначе прерываем при 400+
+		// Явно считаем файл существующим только при 200-399
 		if resp.StatusCode >= 200 && resp.StatusCode < 400 {
 			contentLengthStr := resp.Header.Get("Content-Length")
 			contentLength, _ := strconv.ParseInt(contentLengthStr, 10, 64) // Игнорируем ошибку, если заголовок отсутствует
 			return true, contentLength, nil
-		} else if resp.StatusCode >= 400 {
+		} else if resp.StatusCode == 403 || resp.StatusCode == 404 {
+			// Создаём пустой файл только для depth
+			if dataType == "depth" {
+				relativePath := strings.TrimPrefix(urlStr, strings.TrimSuffix("https://img.bitgetimg.com/online", "/")+"/")
+				localPath := filepath.Join(outputDir, relativePath)
+				if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
+					if debug {
+						log.Printf("Failed to create directory for %s: %v", localPath, err)
+					}
+					return false, 0, nil
+				}
+				if err := os.WriteFile(localPath, []byte{}, 0644); err != nil {
+					if debug {
+						log.Printf("Failed to create empty file %s: %v", localPath, err)
+					}
+					return false, 0, nil
+				}
+				if debug {
+					log.Printf("Created empty file %s for status %d", localPath, resp.StatusCode)
+				}
+			}
 			return false, 0, nil
 		}
 	}
@@ -225,40 +260,50 @@ func CheckFileExists(urlStr string, proxies []string, userAgent string, debug bo
 	return false, 0, fmt.Errorf("failed to check %s after %d attempts: %v", urlStr, maxAttempts, lastErr)
 }
 
-// ReadProxyCount читает количество прокси из файла.
+// ReadProxyCount читает количество прокси из working_file.
 func ReadProxyCount() (int, error) {
-	file, err := os.Open("data/proxies.txt")
+	cfg := struct {
+		Proxy struct {
+			WorkingFile string `yaml:"working_file"`
+		} `yaml:"proxy"`
+	}{}
+	data, err := os.ReadFile("config/config.yaml")
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to read config.yaml: %w", err)
+	}
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return 0, fmt.Errorf("failed to parse config.yaml: %w", err)
+	}
+
+	file, err := os.Open(cfg.Proxy.WorkingFile)
+	if err != nil {
+		return 0, fmt.Errorf("failed to open working proxies file %s: %w", cfg.Proxy.WorkingFile, err)
 	}
 	defer file.Close()
 
 	count := 0
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		if strings.TrimSpace(scanner.Text()) != "" {
-			count++
-		}
+		count++
 	}
-	if count == 0 {
-		return 0, fmt.Errorf("proxy list is empty")
+	if err := scanner.Err(); err != nil {
+		return 0, fmt.Errorf("failed to read working proxies file: %w", err)
 	}
-	return count, scanner.Err()
+	return count, nil
 }
 
-// PrintHelp выводит справку.
+// PrintHelp выводит справку по флагам.
 func PrintHelp() {
-	fmt.Println("Bitget History Downloader")
 	fmt.Println("Usage: bitget-history [options]")
 	fmt.Println("Options:")
-	fmt.Println("  --help, -h          		Show this help message")
-	fmt.Println("  --pair, -p string   		Trading pair (e.g., BTCUSDT) (default: BTCUSDT)")
-	fmt.Println("  --type, -t string   		Data type: trades or depth (required)")
-	fmt.Println("  --market, -m string 		Market type: spot, futures or all (default: all)")
-	fmt.Println("  --start, -s string  		Start date (YYYY-MM-DD, default: 1 year ago)")
-	fmt.Println("  --end, -e string    		End date (YYYY-MM-DD, default: today)")
-	fmt.Println("  --timeout, -T int   		Proxy check timeout in seconds (default: 3)")
-	fmt.Println("  --debug, -d         		Enable debug logging")
-	fmt.Println("  --skip-if-exists, -S		Skip downloading if file exists locally (for depth only)")
-	fmt.Println("  --repeat, -r        		Repeat process until all files are downloaded (for depth with --skip-if-exists only)")
+	fmt.Println("  -h, --help            Show this help message")
+	fmt.Println("  -p, --pair string     Trading pair (e.g., BTCUSDT) (default: BTCUSDT)")
+	fmt.Println("  -t, --type string     Data type: trades or depth (required)")
+	fmt.Println("  -m, --market string   Market type: spot, futures, or all (default: all)")
+	fmt.Println("  -s, --start string    Start date (YYYY-MM-DD) (default: 1 year ago)")
+	fmt.Println("  -e, --end string      End date (YYYY-MM-DD) (default: today)")
+	fmt.Println("  -T, --timeout int     Proxy check timeout in seconds (default: 3)")
+	fmt.Println("  -d, --debug           Enable debug logging")
+	fmt.Println("  -S, --skip-if-exists  Skip downloading if file exists locally")
+	fmt.Println("  -r, --repeat          Repeat process until all files are downloaded (only for depth with -S)")
 }
