@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -202,7 +203,8 @@ func main() {
 		}
 
 		// Запускаем загрузку
-		log.Println("\nDownloading files...")
+		fmt.Fprintln(os.Stdout)
+		log.Println("Downloading files...")
 		if err := dl.DownloadFiles(context.Background(), urls); err != nil {
 			log.Printf("Warning: some files failed to download: %v", err)
 		}

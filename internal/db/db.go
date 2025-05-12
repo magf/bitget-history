@@ -262,7 +262,8 @@ func (db *DB) ProcessZipFiles(zipFiles []string, debug bool) error {
 		}
 	}
 
-	log.Printf("\nTemporary files left in %s for debugging", tmpRawDataDir)
+	fmt.Fprintln(os.Stdout)
+	log.Printf("Temporary files left in %s for debugging", tmpRawDataDir)
 	return nil
 }
 
