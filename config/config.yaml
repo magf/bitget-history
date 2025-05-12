@@ -6,6 +6,8 @@ proxy:
   password: ""
 database:
   path: "/var/lib/bitget-history/database"
+  temp_path: "/tmp/bitget-history/database"
+  bak_suffix: "~"
 downloader:
   base_url: "https://img.bitgetimg.com/online"
   user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"

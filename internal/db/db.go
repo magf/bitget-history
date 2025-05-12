@@ -24,25 +24,25 @@ type DB struct {
 }
 
 // NewDB создаёт новое подключение к SQLite и инициализирует схему.
-func NewDB(dbPath, dataType string) (*DB, error) {
+func NewDB(TempDbPath, dataType string) (*DB, error) {
 	// Проверяем, что путь не содержит шаблонов
-	if strings.Contains(dbPath, "%s") {
-		return nil, fmt.Errorf("invalid database path: %s contains placeholder %%s", dbPath)
+	if strings.Contains(TempDbPath, "%s") {
+		return nil, fmt.Errorf("invalid database path: %s contains placeholder %%s", TempDbPath)
 	}
 	if dataType != "trades" && dataType != "depth" {
 		return nil, fmt.Errorf("invalid data type: %s (must be trades or depth)", dataType)
 	}
-	log.Printf("Opening database: %s for %s", dbPath, dataType)
-	conn, err := sql.Open("sqlite3", dbPath)
+	log.Printf("Opening database: %s for %s", TempDbPath, dataType)
+	conn, err := sql.Open("sqlite3", TempDbPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open database %s: %w", dbPath, err)
+		return nil, fmt.Errorf("failed to open database %s: %w", TempDbPath, err)
 	}
 
 	// Включаем WAL для производительности
 	_, err = conn.Exec("PRAGMA journal_mode=WAL;")
 	if err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("failed to set WAL mode for %s: %w", dbPath, err)
+		return nil, fmt.Errorf("failed to set WAL mode for %s: %w", TempDbPath, err)
 	}
 
 	if dataType == "trades" {
@@ -59,17 +59,17 @@ func NewDB(dbPath, dataType string) (*DB, error) {
 		`)
 		if err != nil {
 			conn.Close()
-			return nil, fmt.Errorf("failed to create trades table in %s: %w", dbPath, err)
+			return nil, fmt.Errorf("failed to create trades table in %s: %w", TempDbPath, err)
 		}
-		log.Printf("Created trades table in %s", dbPath)
+		log.Printf("Created trades table in %s", TempDbPath)
 
 		// Создаём индекс
 		_, err = conn.Exec("CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp)")
 		if err != nil {
 			conn.Close()
-			return nil, fmt.Errorf("failed to create index idx_trades_timestamp in %s: %w", dbPath, err)
+			return nil, fmt.Errorf("failed to create index idx_trades_timestamp in %s: %w", TempDbPath, err)
 		}
-		log.Printf("Created index idx_trades_timestamp in %s", dbPath)
+		log.Printf("Created index idx_trades_timestamp in %s", TempDbPath)
 	} else { // depth
 		// Создаём таблицу 1 (spot)
 		_, err = conn.Exec(`
@@ -84,9 +84,9 @@ func NewDB(dbPath, dataType string) (*DB, error) {
 		`)
 		if err != nil {
 			conn.Close()
-			return nil, fmt.Errorf("failed to create table 1 in %s: %w", dbPath, err)
+			return nil, fmt.Errorf("failed to create table 1 in %s: %w", TempDbPath, err)
 		}
-		log.Printf("Created table 1 in %s", dbPath)
+		log.Printf("Created table 1 in %s", TempDbPath)
 
 		// Создаём таблицу 2 (futures)
 		_, err = conn.Exec(`
@@ -101,27 +101,27 @@ func NewDB(dbPath, dataType string) (*DB, error) {
 		`)
 		if err != nil {
 			conn.Close()
-			return nil, fmt.Errorf("failed to create table 2 in %s: %w", dbPath, err)
+			return nil, fmt.Errorf("failed to create table 2 in %s: %w", TempDbPath, err)
 		}
-		log.Printf("Created table 2 in %s", dbPath)
+		log.Printf("Created table 2 in %s", TempDbPath)
 
 		// Создаём индексы
 		_, err = conn.Exec(`CREATE INDEX IF NOT EXISTS idx_1_timestamp ON "1"(timestamp)`)
 		if err != nil {
 			conn.Close()
-			return nil, fmt.Errorf("failed to create index idx_1_timestamp in %s: %w", dbPath, err)
+			return nil, fmt.Errorf("failed to create index idx_1_timestamp in %s: %w", TempDbPath, err)
 		}
-		log.Printf("Created index idx_1_timestamp in %s", dbPath)
+		log.Printf("Created index idx_1_timestamp in %s", TempDbPath)
 
 		_, err = conn.Exec(`CREATE INDEX IF NOT EXISTS idx_2_timestamp ON "2"(timestamp)`)
 		if err != nil {
 			conn.Close()
-			return nil, fmt.Errorf("failed to create index idx_2_timestamp in %s: %w", dbPath, err)
+			return nil, fmt.Errorf("failed to create index idx_2_timestamp in %s: %w", TempDbPath, err)
 		}
-		log.Printf("Created index idx_2_timestamp in %s", dbPath)
+		log.Printf("Created index idx_2_timestamp in %s", TempDbPath)
 	}
 
-	return &DB{conn: conn, path: dbPath, dataType: dataType}, nil
+	return &DB{conn: conn, path: TempDbPath, dataType: dataType}, nil
 }
 
 // Close закрывает подключение к базе и синкает WAL.
@@ -147,14 +147,14 @@ func (db *DB) Close() error {
 
 // ProcessZipFiles обрабатывает Zip-файлы и выгружает данные в SQLite.
 func (db *DB) ProcessZipFiles(zipFiles []string, debug bool) error {
-	tmpDir := "/tmp/bitget-history"
+	tmpRawDataDir := "/tmp/bitget-history/raw"
 	// Очищаем /tmp/bitget-history перед началом
-	log.Printf("Cleaning temporary directory: %s", tmpDir)
-	if err := os.RemoveAll(tmpDir); err != nil {
-		return fmt.Errorf("failed to clean %s: %w", tmpDir, err)
+	log.Printf("Cleaning temporary directory: %s", tmpRawDataDir)
+	if err := os.RemoveAll(tmpRawDataDir); err != nil {
+		return fmt.Errorf("failed to clean %s: %w", tmpRawDataDir, err)
 	}
-	if err := os.MkdirAll(tmpDir, 0755); err != nil {
-		return fmt.Errorf("failed to create %s: %w", tmpDir, err)
+	if err := os.MkdirAll(tmpRawDataDir, 0755); err != nil {
+		return fmt.Errorf("failed to create %s: %w", tmpRawDataDir, err)
 	}
 
 	// Дропаем таблицы перед обработкой
@@ -250,19 +250,24 @@ func (db *DB) ProcessZipFiles(zipFiles []string, debug bool) error {
 			continue // Пропускаем пустой файл
 		}
 
-		log.Printf("Processing zip file: %s", zipPath)
-		if err := db.processSingleZip(zipPath, tmpDir); err != nil {
+		if debug {
+			log.Printf("Processing zip file: %s", zipPath)
+		} else {
+			fmt.Fprintf(os.Stdout, "\r  Processing zip file: %-70s                    \r", zipPath)
+		}
+
+		if err := db.processSingleZip(zipPath, tmpRawDataDir, debug); err != nil {
 			log.Printf("Failed to process %s: %v", zipPath, err)
 			continue // Продолжаем с другими файлами
 		}
 	}
 
-	log.Printf("Temporary files left in %s for debugging", tmpDir)
+	log.Printf("\nTemporary files left in %s for debugging", tmpRawDataDir)
 	return nil
 }
 
 // processSingleZip обрабатывает один Zip-файл.
-func (db *DB) processSingleZip(zipPath, tmpDir string) error {
+func (db *DB) processSingleZip(zipPath, tmpRawDataDir string, debug bool) error {
 	// Открываем Zip
 	zipReader, err := zip.OpenReader(zipPath)
 	if err != nil {
@@ -305,7 +310,7 @@ func (db *DB) processSingleZip(zipPath, tmpDir string) error {
 		}
 	}
 	csvFileName := fmt.Sprintf("%s_%s.csv", marketCode, zipBase)
-	csvPath := filepath.Join(tmpDir, csvFileName)
+	csvPath := filepath.Join(tmpRawDataDir, csvFileName)
 
 	// Если CSV найден, извлекаем его
 	if csvFile != nil {
@@ -315,7 +320,7 @@ func (db *DB) processSingleZip(zipPath, tmpDir string) error {
 		log.Printf("Extracted CSV: %s", csvPath)
 	} else if xlsxFile != nil {
 		// Извлекаем XLSX
-		xlsxPath := filepath.Join(tmpDir, xlsxFile.Name)
+		xlsxPath := filepath.Join(tmpRawDataDir, xlsxFile.Name)
 		if err := extractFile(xlsxFile, xlsxPath); err != nil {
 			return fmt.Errorf("failed to extract XLSX from %s: %w", zipPath, err)
 		}
@@ -323,7 +328,9 @@ func (db *DB) processSingleZip(zipPath, tmpDir string) error {
 		if err := convertXLSXtoCSV(xlsxPath, csvPath); err != nil {
 			return fmt.Errorf("failed to convert XLSX to CSV for %s: %w", zipPath, err)
 		}
-		log.Printf("Converted XLSX to CSV: %s", csvPath)
+		if debug {
+			log.Printf("Converted XLSX to CSV: %s", csvPath)
+		}
 	} else {
 		return fmt.Errorf("no CSV file found in %s (and no XLSX to convert)", zipPath)
 	}
@@ -331,9 +338,9 @@ func (db *DB) processSingleZip(zipPath, tmpDir string) error {
 	// Обрабатываем CSV
 	if db.dataType == "depth" {
 		tableName := marketCode // "1" или "2"
-		return db.processDepthCSV(zipPath, csvPath, tableName)
+		return db.processDepthCSV(zipPath, csvPath, tableName, debug)
 	}
-	return db.processTradesCSV(zipPath, csvPath)
+	return db.processTradesCSV(zipPath, csvPath, debug)
 }
 
 // extractFile извлекает файл из Zip в указанный путь.
@@ -442,7 +449,7 @@ func convertXLSXtoCSV(xlsxPath, csvPath string) error {
 }
 
 // processTradesCSV обрабатывает CSV для trades.
-func (db *DB) processTradesCSV(zipPath, csvPath string) error {
+func (db *DB) processTradesCSV(zipPath, csvPath string, debug bool) error {
 	csvFile, err := os.Open(csvPath)
 	if err != nil {
 		return fmt.Errorf("failed to open CSV %s: %w", csvPath, err)
@@ -456,7 +463,9 @@ func (db *DB) processTradesCSV(zipPath, csvPath string) error {
 		return fmt.Errorf("failed to read CSV %s: %w", csvPath, err)
 	}
 
-	log.Printf("Processed %d rows from CSV: %s", len(records)-1, csvPath)
+	if debug {
+		log.Printf("Processed %d rows from CSV: %s", len(records)-1, csvPath)
+	}
 
 	tx, err := db.conn.Begin()
 	if err != nil {
@@ -553,14 +562,16 @@ func (db *DB) processTradesCSV(zipPath, csvPath string) error {
 	if err != nil {
 		log.Printf("Failed to perform WAL checkpoint after trades CSV %s: %v", csvPath, err)
 	} else {
-		log.Printf("WAL checkpoint successful after trades CSV %s", csvPath)
+		if debug {
+			log.Printf("WAL checkpoint successful after trades CSV %s", csvPath)
+		}
 	}
 
 	return nil
 }
 
 // processDepthCSV обрабатывает CSV для depth.
-func (db *DB) processDepthCSV(zipPath, csvPath, tableName string) error {
+func (db *DB) processDepthCSV(zipPath, csvPath, tableName string, debug bool) error {
 	csvFile, err := os.Open(csvPath)
 	if err != nil {
 		return fmt.Errorf("failed to open CSV %s: %w", csvPath, err)
@@ -574,7 +585,9 @@ func (db *DB) processDepthCSV(zipPath, csvPath, tableName string) error {
 		return fmt.Errorf("failed to read CSV %s: %w", csvPath, err)
 	}
 
-	log.Printf("Processed %d rows from CSV: %s", len(records)-1, csvPath)
+	if debug {
+		log.Printf("Processed %d rows from CSV: %s", len(records)-1, csvPath)
+	}
 
 	tx, err := db.conn.Begin()
 	if err != nil {
@@ -656,14 +669,17 @@ func (db *DB) processDepthCSV(zipPath, csvPath, tableName string) error {
 		tx.Rollback()
 		return fmt.Errorf("failed to commit transaction for table %s in %s: %w", tableName, db.path, err)
 	}
-	log.Printf("Committed transaction for depth CSV %s in %s (table %s), inserted %d rows, skipped %d rows", csvPath, db.path, tableName, inserted, skipped)
-
+	if debug {
+		log.Printf("Committed transaction for depth CSV %s in %s (table %s), inserted %d rows, skipped %d rows", csvPath, db.path, tableName, inserted, skipped)
+	}
 	// Выполняем чекпоинт WAL
 	_, err = db.conn.Exec("PRAGMA wal_checkpoint(TRUNCATE);")
 	if err != nil {
 		log.Printf("Failed to perform WAL checkpoint after depth CSV %s (table %s): %v", csvPath, tableName, err)
 	} else {
-		log.Printf("WAL checkpoint successful after depth CSV %s (table %s)", csvPath, tableName)
+		if debug {
+			log.Printf("WAL checkpoint successful after depth CSV %s (table %s)", csvPath, tableName)
+		}
 	}
 
 	return nil

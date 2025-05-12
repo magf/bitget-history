@@ -27,7 +27,9 @@ type Config struct {
 		Password    string `yaml:"password"`
 	} `yaml:"proxy"`
 	Database struct {
-		Path string `yaml:"path"`
+		Path         string `yaml:"path"`
+		TempPath     string `yaml:"temp_path"`
+		BackupSuffix string `yaml:"bak_suffix"`
 	} `yaml:"database"`
 	Downloader struct {
 		BaseURL   string `yaml:"base_url"`
@@ -135,10 +137,15 @@ func main() {
 	}
 
 	// Проверяем путь к базе
-	if cfg.Database.Path == "" || strings.Contains(cfg.Database.Path, "%s") {
-		log.Fatalf("Error: invalid database path in config: %s", cfg.Database.Path)
+	if cfg.Database.TempPath == "" || strings.Contains(cfg.Database.TempPath, "%s") {
+		log.Fatalf("Error: invalid temp database path in config: %s", cfg.Database.TempPath)
 	}
-	log.Printf("Using database root path from config: %s", cfg.Database.Path)
+	log.Printf("Using temp database path from config: %s", cfg.Database.TempPath)
+
+	if cfg.Database.Path == "" || strings.Contains(cfg.Database.Path, "%s") {
+		log.Fatalf("Error: invalid root database path in config: %s", cfg.Database.Path)
+	}
+	log.Printf("Using root database path from config: %s", cfg.Database.Path)
 
 	// Создаём ProxyManager
 	timeout := time.Duration(*timeoutFlag) * time.Second
@@ -152,7 +159,6 @@ func main() {
 
 	// Проверяем --repeat
 	if *repeatFlag && (*typeFlag != "depth" || !*skipIfExistsFlag) {
-		log.Printf("Warning: --repeat (-r) is only supported for -t depth with -S, ignoring")
 		*repeatFlag = false
 	}
 
@@ -189,30 +195,33 @@ func main() {
 		}
 
 		// Генерируем URL-ы
+		log.Println("Generating URLs...")
 		urls, err := cmdutils.GenerateURLs(cfg.Downloader.BaseURL, *marketFlag, *pairFlag, *typeFlag, startDate, endDate, *debugFlag, *skipIfExistsFlag, proxies, cfg.Downloader.UserAgent, outputDir)
 		if err != nil {
 			log.Fatalf("Failed to generate URLs: %v", err)
 		}
 
 		// Запускаем загрузку
-		log.Println("Downloading files...")
+		log.Println("\nDownloading files...")
 		if err := dl.DownloadFiles(context.Background(), urls); err != nil {
 			log.Printf("Warning: some files failed to download: %v", err)
 		}
 
 		// Группируем ZIP-файлы по типу и рынку
 		type ZipGroup struct {
-			dbPath string
-			files  []string
+			TempDbPath string
+			dbPath     string
+			files      []string
 		}
-		var zipGroups []ZipGroup
 
 		// Нормализуем BaseURL для TrimPrefix
 		baseURLPrefix := strings.TrimSuffix(cfg.Downloader.BaseURL, "/") + "/"
 		log.Printf("Using baseURLPrefix for trimming: %s", baseURLPrefix)
 
-		// Обрабатываем только trades внутри цикла
+		// Обрабатываем trades
 		if *typeFlag == "trades" {
+			log.Println("Processing Trades...")
+			var zipGroups []ZipGroup
 			spblFiles := make([]string, 0)
 			umcblFiles := make([]string, 0)
 			for _, fileInfo := range urls {
@@ -231,40 +240,105 @@ func main() {
 			}
 			if (*marketFlag == "spot" || *marketFlag == "all") && len(spblFiles) > 0 {
 				dbPath := filepath.Join(cfg.Database.Path, "trades", "SPBL", *pairFlag+".db")
+				TempDbPath := filepath.Join(cfg.Database.TempPath, "trades", "SPBL", *pairFlag+".db")
 				sort.Strings(spblFiles)
-				log.Printf("Adding SPBL group: dbPath=%s, files=%v", dbPath, spblFiles)
-				zipGroups = append(zipGroups, ZipGroup{dbPath: dbPath, files: spblFiles})
+				log.Printf("Adding SPBL group: TempDbPath=%s, files=%v", TempDbPath, spblFiles)
+				zipGroups = append(zipGroups, ZipGroup{dbPath: dbPath, TempDbPath: TempDbPath, files: spblFiles})
 			}
 			if (*marketFlag == "futures" || *marketFlag == "all") && len(umcblFiles) > 0 {
 				dbPath := filepath.Join(cfg.Database.Path, "trades", "UMCBL", *pairFlag+".db")
+				TempDbPath := filepath.Join(cfg.Database.TempPath, "trades", "UMCBL", *pairFlag+".db")
 				sort.Strings(umcblFiles)
-				log.Printf("Adding UMCBL group: dbPath=%s, files=%v", dbPath, umcblFiles)
-				zipGroups = append(zipGroups, ZipGroup{dbPath: dbPath, files: umcblFiles})
+				log.Printf("Adding UMCBL group: TempDbPath=%s, files=%v", TempDbPath, umcblFiles)
+				zipGroups = append(zipGroups, ZipGroup{dbPath: dbPath, TempDbPath: TempDbPath, files: umcblFiles})
 			}
 			if len(spblFiles) == 0 && len(umcblFiles) == 0 {
 				log.Printf("No trades files found")
 			}
+			for _, group := range zipGroups {
+				log.Printf("Processing database: %s with %d zip files", group.TempDbPath, len(group.files))
+				if err := os.MkdirAll(filepath.Dir(group.TempDbPath), 0755); err != nil {
+					log.Printf("Failed to create directory for %s: %v", group.TempDbPath, err)
+					continue
+				}
+				dbInstance, err := db.NewDB(group.TempDbPath, *typeFlag)
+				if err != nil {
+					log.Printf("Failed to create database %s: %v", group.TempDbPath, err)
+					continue
+				}
+				if err := dbInstance.ProcessZipFiles(group.files, *debugFlag); err != nil {
+					log.Printf("Failed to process zip files for %s: %v", group.TempDbPath, err)
+				}
+				if err := dbInstance.Close(); err != nil {
+					log.Printf("Failed to close database %s: %v", group.TempDbPath, err)
+				}
+				if err := cmdutils.MoveTempDatabase(group.TempDbPath, group.dbPath, cfg.Database.BackupSuffix, *debugFlag); err != nil {
+					log.Fatalf("Error: %v\n", err)
+				}
+			}
 		}
 
-		// Обрабатываем trades
-		for _, group := range zipGroups {
-			log.Printf("Processing database: %s with %d zip files", group.dbPath, len(group.files))
-			if err := os.MkdirAll(filepath.Dir(group.dbPath), 0755); err != nil {
-				log.Printf("Failed to create directory for %s: %v", group.dbPath, err)
-				continue
+		// Обрабатываем depth
+		if *typeFlag == "depth" {
+			log.Println("Processing Depth...")
+			dbPath := filepath.Join(cfg.Database.Path, "depth", *pairFlag+".db")
+			TempDbPath := filepath.Join(cfg.Database.TempPath, "depth", *pairFlag+".db")
+			var depthFiles []string
+
+			// Собираем все ZIP-файлы из директорий spot (1) и futures (2)
+			marketCodes := []string{"1"} // spot
+			if *marketFlag == "futures" {
+				marketCodes = []string{"2"}
+			} else if *marketFlag == "all" {
+				marketCodes = []string{"1", "2"}
 			}
-			dbInstance, err := db.NewDB(group.dbPath, *typeFlag)
-			if err != nil {
-				log.Printf("Failed to create database %s: %v", group.dbPath, err)
-				continue
+
+			for _, marketCode := range marketCodes {
+				dir := filepath.Join(outputDir, "depth", *pairFlag, marketCode)
+				err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+					if err != nil {
+						return err
+					}
+					if !info.IsDir() && strings.HasSuffix(info.Name(), ".zip") {
+						depthFiles = append(depthFiles, path)
+					}
+					return nil
+				})
+				if err != nil {
+					log.Printf("Failed to walk directory %s: %v", dir, err)
+				}
 			}
-			if err := dbInstance.ProcessZipFiles(group.files, *debugFlag); err != nil {
-				log.Printf("Failed to process zip files for %s: %v", group.dbPath, err)
+
+			if len(depthFiles) > 0 {
+				// Сортируем файлы в алфавитном порядке
+				sort.Strings(depthFiles)
+				log.Printf("Processing depth database: %s with %d zip files", TempDbPath, len(depthFiles))
+
+				// Создаём директорию для базы
+				if err := os.MkdirAll(filepath.Dir(TempDbPath), 0755); err != nil {
+					log.Printf("Failed to create directory for %s: %v", TempDbPath, err)
+				} else {
+					// Обрабатываем базу
+					dbInstance, err := db.NewDB(TempDbPath, *typeFlag)
+					if err != nil {
+						log.Printf("Failed to create database %s: %v", TempDbPath, err)
+					} else {
+						if err := dbInstance.ProcessZipFiles(depthFiles, *debugFlag); err != nil {
+							log.Printf("Failed to process zip files for %s: %v", TempDbPath, err)
+						}
+						if err := dbInstance.Close(); err != nil {
+							log.Printf("Failed to close database %s: %v", TempDbPath, err)
+						}
+					}
+				}
+			} else {
+				log.Printf("No depth files found for %s", TempDbPath)
 			}
-			if err := dbInstance.Close(); err != nil {
-				log.Printf("Failed to close database %s: %v", group.dbPath, err)
+			if err := cmdutils.MoveTempDatabase(TempDbPath, dbPath, cfg.Database.BackupSuffix, *debugFlag); err != nil {
+				log.Fatalf("Error: %v\n", err)
 			}
 		}
+		log.Printf("Repeat cycle: %d URLs remaining, continuing...", len(urls))
 
 		// Проверяем, нужно ли повторять
 		if !*repeatFlag || len(urls) == 0 {
@@ -272,64 +346,6 @@ func main() {
 				log.Println("Repeat cycle completed: no URLs remaining")
 			}
 			break
-		}
-
-		log.Printf("Repeat cycle: %d URLs remaining, continuing...", len(urls))
-	}
-
-	// Финальная обработка для depth
-	if *typeFlag == "depth" {
-		dbPath := filepath.Join(cfg.Database.Path, "depth", *pairFlag+".db")
-		var depthFiles []string
-
-		// Собираем все ZIP-файлы из директорий spot (1) и futures (2)
-		marketCodes := []string{"1"} // spot
-		if *marketFlag == "futures" {
-			marketCodes = []string{"2"}
-		} else if *marketFlag == "all" {
-			marketCodes = []string{"1", "2"}
-		}
-
-		for _, marketCode := range marketCodes {
-			dir := filepath.Join(outputDir, "depth", *pairFlag, marketCode)
-			err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-				if err != nil {
-					return err
-				}
-				if !info.IsDir() && strings.HasSuffix(info.Name(), ".zip") {
-					depthFiles = append(depthFiles, path)
-				}
-				return nil
-			})
-			if err != nil {
-				log.Printf("Failed to walk directory %s: %v", dir, err)
-			}
-		}
-
-		if len(depthFiles) > 0 {
-			// Сортируем файлы в алфавитном порядке
-			sort.Strings(depthFiles)
-			log.Printf("Processing depth database: %s with %d zip files", dbPath, len(depthFiles))
-
-			// Создаём директорию для базы
-			if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
-				log.Printf("Failed to create directory for %s: %v", dbPath, err)
-			} else {
-				// Обрабатываем базу
-				dbInstance, err := db.NewDB(dbPath, *typeFlag)
-				if err != nil {
-					log.Printf("Failed to create database %s: %v", dbPath, err)
-				} else {
-					if err := dbInstance.ProcessZipFiles(depthFiles, *debugFlag); err != nil {
-						log.Printf("Failed to process zip files for %s: %v", dbPath, err)
-					}
-					if err := dbInstance.Close(); err != nil {
-						log.Printf("Failed to close database %s: %v", dbPath, err)
-					}
-				}
-			}
-		} else {
-			log.Printf("No depth files found for %s", dbPath)
 		}
 	}
 

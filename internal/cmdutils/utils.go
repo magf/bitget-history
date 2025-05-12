@@ -3,6 +3,7 @@ package cmdutils
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"math/rand"
@@ -90,6 +91,8 @@ func GenerateURLs(baseURL, market, pair, dataType string, startDate, endDate tim
 							urls = append(urls, downloader.FileInfo{URL: url, ContentLength: contentLength})
 							if debug {
 								log.Printf("Generated URL: %s (Content-Length: %d)", url, contentLength)
+							} else {
+								fmt.Fprintf(os.Stdout, "\r  Generated URL: %-90s (Content-Length: %d)                    \r", url, contentLength)
 							}
 							mu.Unlock()
 						}(url, batchPaths[i])
@@ -146,6 +149,8 @@ func GenerateURLs(baseURL, market, pair, dataType string, startDate, endDate tim
 					urls = append(urls, downloader.FileInfo{URL: url, ContentLength: contentLength})
 					if debug {
 						log.Printf("Generated URL: %s (Content-Length: %d)", url, contentLength)
+					} else {
+						fmt.Fprintf(os.Stdout, "\r  Generated URL: %-90s (Content-Length: %d)                    \r", url, contentLength)
 					}
 					mu.Unlock()
 				}(url, path)
@@ -161,10 +166,8 @@ func GenerateURLs(baseURL, market, pair, dataType string, startDate, endDate tim
 		return nil, fmt.Errorf("failed to read proxy count: %w", err)
 	}
 	rotationFactor := int(math.Ceil(float64(days) / float64(proxyCount)))
-	if debug {
-		log.Printf("Days: %d, Proxies: %d, Rotation factor: %d", days, proxyCount, rotationFactor)
-		log.Printf("Generated %d URLs: %v", len(urls), urls)
-	}
+	log.Printf("Days: %d, Proxies: %d, Rotation factor: %d", days, proxyCount, rotationFactor)
+	log.Printf("Generated %d URLs: %v", len(urls), urls)
 
 	return urls, nil
 }
@@ -290,6 +293,54 @@ func ReadProxyCount() (int, error) {
 		return 0, fmt.Errorf("failed to read working proxies file: %w", err)
 	}
 	return count, nil
+}
+
+// MoveTempDatabase переименовывает существующую базу в файл с указанным расширением и перемещает временную базу на её место.
+func MoveTempDatabase(TempDbPath, dbPath, BackupSuffix string, debug bool) error {
+	backupPath := dbPath + BackupSuffix
+	if _, err := os.Stat(dbPath); err == nil {
+		if err := os.Rename(dbPath, backupPath); err != nil {
+			return fmt.Errorf("failed to backup database %s to %s: %w", dbPath, backupPath, err)
+		}
+		if debug {
+			log.Printf("Backed up database to %s", backupPath)
+		}
+	}
+	srcFile, err := os.Open(TempDbPath)
+	if err != nil {
+		if _, err := os.Stat(backupPath); err == nil {
+			os.Rename(backupPath, dbPath)
+		}
+		return fmt.Errorf("failed to open temporary database %s: %w", TempDbPath, err)
+	}
+	defer srcFile.Close()
+	dstFile, err := os.Create(dbPath)
+	if err != nil {
+		if _, err := os.Stat(backupPath); err == nil {
+			os.Rename(backupPath, dbPath)
+		}
+		return fmt.Errorf("failed to create database %s: %w", dbPath, err)
+	}
+	defer dstFile.Close()
+	if _, err := io.Copy(dstFile, srcFile); err != nil {
+		if _, err := os.Stat(backupPath); err == nil {
+			os.Rename(backupPath, dbPath)
+		}
+		return fmt.Errorf("failed to copy temporary database %s to %s: %w", TempDbPath, dbPath, err)
+	}
+	if err := dstFile.Sync(); err != nil {
+		if _, err := os.Stat(backupPath); err == nil {
+			os.Rename(backupPath, dbPath)
+		}
+		return fmt.Errorf("failed to sync database %s: %w", dbPath, err)
+	}
+	if debug {
+		log.Printf("Copied temporary database to %s", dbPath)
+	}
+	if err := os.Remove(TempDbPath); err != nil {
+		log.Printf("Warning: failed to remove temporary database %s: %v", TempDbPath, err)
+	}
+	return nil
 }
 
 // PrintHelp выводит справку по флагам.
