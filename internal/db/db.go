@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3" // Драйвер SQLite
 	"github.com/tealeg/xlsx/v3"
@@ -684,4 +685,64 @@ func (db *DB) processDepthCSV(zipPath, csvPath, tableName string, debug bool) er
 	}
 
 	return nil
+}
+
+func ExportToMT5CSV(dbPath, pair, market string, startDate, endDate time.Time) (string, error) {
+	// Путь к базе из конфига (предполагаем, что database.path = "database")
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		// Если базы нет, пропускаем без ошибки
+		return "", nil
+	}
+
+	// Открываем базу
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return "", err
+	}
+	defer db.Close()
+
+	// SQL-запрос для минутных баров
+	query := `
+		SELECT 
+			strftime('%Y.%m.%d', datetime(timestamp, 'unixepoch')) AS Date,
+			strftime('%H:%M', datetime(timestamp, 'unixepoch')) AS Time,
+			FIRST_VALUE(bid_price) OVER (PARTITION BY strftime('%Y-%m-%d %H:%M', datetime(timestamp, 'unixepoch')) ORDER BY timestamp) AS Open,
+			MAX(bid_price) OVER (PARTITION BY strftime('%Y-%m-%d %H:%M', datetime(timestamp, 'unixepoch'))) AS High,
+			MIN(bid_price) OVER (PARTITION BY strftime('%Y-%m-%d %H:%M', datetime(timestamp, 'unixepoch'))) AS Low,
+			LAST_VALUE(bid_price) OVER (PARTITION BY strftime('%Y-%m-%d %H:%M', datetime(timestamp, 'unixepoch')) ORDER BY timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS Close,
+			SUM(ask_volume + bid_volume) OVER (PARTITION BY strftime('%Y-%m-%d %H:%M', datetime(timestamp, 'unixepoch'))) AS Volume
+		FROM '` + market + `'
+		WHERE timestamp >= ? AND timestamp <= ?
+		ORDER BY timestamp;
+	`
+	rows, err := db.Query(query, startDate.Unix(), endDate.Unix())
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+
+	// Имя выходного файла
+	outputFile := "/tmp/bitget-history/" + pair + "_" + market + ".csv"
+	csvFile, err := os.Create(outputFile)
+	if err != nil {
+		return "", err
+	}
+	defer csvFile.Close()
+
+	writer := csv.NewWriter(csvFile)
+	defer writer.Flush()
+
+	// Пишем заголовки
+	writer.Write([]string{"Date", "Time", "Open", "High", "Low", "Close", "Volume"})
+
+	// Пишем данные
+	for rows.Next() {
+		var date, timeStr, open, high, low, close, volume string
+		if err := rows.Scan(&date, &timeStr, &open, &high, &low, &close, &volume); err != nil {
+			return "", err
+		}
+		writer.Write([]string{date, timeStr, open, high, low, close, volume})
+	}
+
+	return outputFile, nil
 }
