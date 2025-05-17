@@ -3,6 +3,7 @@ package downloader
 import (
 	"archive/zip"
 	"context"
+	"database/sql"
 	"fmt"
 	"io"
 	"log"
@@ -23,11 +24,12 @@ import (
 
 // Downloader управляет загрузкой файлов.
 type Downloader struct {
-	baseURL    string
-	userAgent  string
-	outputDir  string
-	proxyMgr   *proxymanager.ProxyManager
-	maxRetries int
+	BaseURL       string
+	userAgent     string
+	outputDir     string
+	proxyMgr      *proxymanager.ProxyManager
+	maxRetries    int
+	checkedUrlsDB *sql.DB
 }
 
 // FileInfo хранит информацию о файле.
@@ -37,14 +39,90 @@ type FileInfo struct {
 }
 
 // NewDownloader создаёт новый загрузчик.
-func NewDownloader(baseURL, userAgent, outputDir string, proxyMgr *proxymanager.ProxyManager) (*Downloader, error) {
+func NewDownloader(baseURL, userAgent, outputDir string, proxyMgr *proxymanager.ProxyManager, checkedUrlsDB *sql.DB) (*Downloader, error) {
 	return &Downloader{
-		baseURL:    baseURL,
-		userAgent:  userAgent,
-		outputDir:  outputDir,
-		proxyMgr:   proxyMgr,
-		maxRetries: 5,
+		BaseURL:       baseURL,
+		userAgent:     userAgent,
+		outputDir:     outputDir,
+		proxyMgr:      proxyMgr,
+		maxRetries:    5,
+		checkedUrlsDB: checkedUrlsDB,
 	}, nil
+}
+
+// CheckFileOnline проверяет доступность файла по URL и возвращает код состояния и размер.
+func (d *Downloader) CheckFileOnline(urlStr string, debug bool) (statusCode int, contentLength int64, err error) {
+	// Проверяем, есть ли URL в базе
+	var checkedAt time.Time
+	err = d.checkedUrlsDB.QueryRow(`
+		SELECT status_code, content_length, checked_at
+		FROM checked_urls
+		WHERE url = ?
+	`, urlStr).Scan(&statusCode, &contentLength, &checkedAt)
+	if err == nil {
+		if debug {
+			log.Printf("Found cached URL %s: status=%d, size=%d, checked_at=%s", urlStr, statusCode, contentLength, checkedAt)
+		}
+		return statusCode, contentLength, nil
+	}
+	if err != sql.ErrNoRows {
+		log.Printf("Failed to query checked_urls for %s: %v", urlStr, err)
+	}
+
+	// Если в базе нет, делаем HEAD-запрос
+	proxies, err := d.proxyMgr.GetProxies()
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to get proxies: %w", err)
+	}
+	if len(proxies) == 0 {
+		return 0, 0, fmt.Errorf("no proxies available")
+	}
+
+	proxyURL, err := url.Parse(proxies[rand.Intn(len(proxies))])
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid proxy URL: %w", err)
+	}
+
+	dialer, err := proxy.FromURL(proxyURL, proxy.Direct)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to create proxy %s: %w", proxyURL.String(), err)
+	}
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			Dial: dialer.Dial,
+		},
+		Timeout: 30 * time.Second,
+	}
+
+	req, err := http.NewRequest("HEAD", urlStr, nil)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to create request for %s: %w", urlStr, err)
+	}
+	req.Header.Set("User-Agent", d.userAgent)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to check %s: %w", urlStr, err)
+	}
+	defer resp.Body.Close()
+
+	statusCode = resp.StatusCode
+	contentLength = resp.ContentLength
+	if debug {
+		log.Printf("Checked URL %s: status=%d, size=%d", urlStr, statusCode, contentLength)
+	}
+
+	// Сохраняем результат в базу
+	_, err = d.checkedUrlsDB.Exec(`
+		INSERT OR REPLACE INTO checked_urls (url, status_code, content_length, checked_at)
+		VALUES (?, ?, ?, ?)
+	`, urlStr, statusCode, contentLength, time.Now())
+	if err != nil {
+		log.Printf("Failed to save URL %s to checked_urls: %v", urlStr, err)
+	}
+
+	return statusCode, contentLength, nil
 }
 
 // DownloadFiles загружает файлы по списку URL-ов.
@@ -61,7 +139,7 @@ func (d *Downloader) DownloadFiles(ctx context.Context, files []FileInfo) error 
 		go func(i int, file FileInfo) {
 			defer wg.Done()
 			// Проверяем, существует ли файл и совпадает ли размер
-			relativePath := strings.TrimPrefix(file.URL, d.baseURL+"/")
+			relativePath := strings.TrimPrefix(file.URL, d.BaseURL+"/")
 			outputPath := filepath.Join(d.outputDir, relativePath)
 			if file.ContentLength > 0 {
 				if stat, err := os.Stat(outputPath); err == nil && stat.Size() == file.ContentLength {
@@ -178,7 +256,7 @@ func (d *Downloader) downloadWithProxy(ctx context.Context, fileURL, proxyURLStr
 	}
 
 	// Формируем путь сохранения
-	relativePath := strings.TrimPrefix(fileURL, d.baseURL+"/")
+	relativePath := strings.TrimPrefix(fileURL, d.BaseURL+"/")
 	outputPath := filepath.Join(d.outputDir, relativePath)
 	log.Printf("Saving file to %s", outputPath)
 	if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {

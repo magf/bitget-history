@@ -518,7 +518,12 @@ func (db *DB) processTradesCSV(zipPath, csvPath string, debug bool) error {
 		}
 		affected, _ := result.RowsAffected()
 		if affected == 0 {
-			log.Printf("Skipped record in %s at line %d: duplicate trade_id %s", zipPath, i+1, tradeID)
+			if debug {
+
+				log.Printf("Skipped record in %s at line %d: duplicate trade_id %s", zipPath, i+1, tradeID)
+			} else {
+				fmt.Fprintf(os.Stdout, "\rSkipped record in %s at line %d: duplicate trade_id %s", zipPath, i+1, tradeID)
+			}
 			skipped++
 		} else {
 			inserted++
@@ -529,7 +534,7 @@ func (db *DB) processTradesCSV(zipPath, csvPath string, debug bool) error {
 		tx.Rollback()
 		return fmt.Errorf("failed to commit transaction in %s: %w", db.path, err)
 	}
-	log.Printf("Committed transaction for trades CSV %s in %s, inserted %d rows, skipped %d rows", csvPath, db.path, inserted, skipped)
+	log.Printf("\nCommitted transaction for trades CSV %s in %s, inserted %d rows, skipped %d rows", csvPath, db.path, inserted, skipped)
 
 	// Выполняем чекпоинт WAL
 	_, err = db.conn.Exec("PRAGMA wal_checkpoint(TRUNCATE);")

@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -19,6 +21,7 @@ import (
 	"github.com/magf/bitget-history/internal/proxymanager"
 	"github.com/magf/bitget-history/internal/server/backend"
 	"github.com/magf/bitget-history/internal/server/web"
+	_ "github.com/mattn/go-sqlite3"
 	"gopkg.in/yaml.v3"
 )
 
@@ -57,9 +60,10 @@ func main() {
 	exportMT5 := flag.Bool("export-mt5", false, "Export data to MT5 CSV format")
 	timeoutFlag := flag.Int("timeout", 3, "Proxy check timeout in seconds")
 	debugFlag := flag.Bool("debug", false, "Enable debug logging")
-	skipIfExistsFlag := flag.Bool("skip-if-exists", false, "Skip downloading if file exists locally")
-	repeatFlag := flag.Bool("repeat", false, "Repeat process until all files are downloaded (for --skip-if-exists only)")
+	skipExistsFlag := flag.Bool("skip-exists", false, "Skip downloading if file exists locally")
+	repeatFlag := flag.Bool("repeat", false, "Repeat process until all files are downloaded (for --skip-exists only)")
 	recheckExists := flag.Bool("recheck-exists", false, "Recheck existing non-zero archives for corruption")
+	skipDownloadFlag := flag.Bool("skip-download", false, "Skip downloading and reimport existing local files")
 
 	// Короткие флаги
 	flag.BoolVar(helpFlag, "h", false, "Show help message (short)")
@@ -70,9 +74,10 @@ func main() {
 	flag.StringVar(endFlag, "e", "", "End date (short)")
 	flag.IntVar(timeoutFlag, "T", 3, "Proxy check timeout in seconds (short)")
 	flag.BoolVar(debugFlag, "d", false, "Enable debug logging (short)")
-	flag.BoolVar(skipIfExistsFlag, "S", false, "Skip downloading if file exists locally (short)")
-	flag.BoolVar(repeatFlag, "r", false, "Repeat process until all files are downloaded (for --skip-if-exists only) (short)")
+	flag.BoolVar(skipExistsFlag, "X", false, "Skip downloading if file exists locally (short)")
+	flag.BoolVar(repeatFlag, "r", false, "Repeat process until all files are downloaded (for --skip-exists only) (short)")
 	flag.BoolVar(recheckExists, "R", false, "Recheck existing non-zero archives for corruption (short)")
+	flag.BoolVar(skipDownloadFlag, "S", false, "Skip downloading and reimport existing local files (short)")
 
 	flag.Parse()
 
@@ -120,6 +125,37 @@ func main() {
 		}
 	}
 
+	// Формируем имя базы для проверенных URL-ов из cfg.Downloader.BaseURL
+	// Пример: https://data.bitget.com → bitget_checked_urls.db
+	baseURL := strings.TrimPrefix(cfg.Downloader.BaseURL, "https://")
+	baseURL = strings.TrimPrefix(baseURL, "http://")
+	baseURL = strings.Split(baseURL, "/")[0] // Берём домен
+	baseURL = strings.ReplaceAll(baseURL, ".", "_")
+	checkedUrlsDBName := fmt.Sprintf("%s_checked_urls.db", baseURL)
+	checkedUrlsDBPath := filepath.Join(cfg.Database.Path, checkedUrlsDBName)
+	if err := os.MkdirAll(filepath.Dir(checkedUrlsDBPath), 0755); err != nil {
+		log.Fatalf("Failed to create directory for checked URLs database %s: %v", checkedUrlsDBPath, err)
+	}
+	// Открываем SQLite с WAL и shared cache для многопоточности
+	checkedUrlsDB, err := sql.Open("sqlite3", checkedUrlsDBPath+"?_journal_mode=WAL&cache=shared")
+	if err != nil {
+		log.Fatalf("Failed to open checked URLs database %s: %v", checkedUrlsDBPath, err)
+	}
+	defer checkedUrlsDB.Close()
+
+	// Создаём таблицу checked_urls, если не существует
+	_, err = checkedUrlsDB.Exec(`
+		CREATE TABLE IF NOT EXISTS checked_urls (
+			url TEXT PRIMARY KEY,
+			status_code INTEGER NOT NULL,
+			content_length INTEGER NOT NULL,
+			checked_at TIMESTAMP NOT NULL
+		)
+	`)
+	if err != nil {
+		log.Fatalf("Failed to create checked_urls table: %v", err)
+	}
+
 	// Создаём ProxyManager
 	timeout := time.Duration(*timeoutFlag) * time.Second
 	pm, err := proxymanager.NewProxyManager(cfg.Proxy.RawFile, cfg.Proxy.WorkingFile, cfg.Proxy.Fallback, cfg.Proxy.Username, cfg.Proxy.Password, timeout)
@@ -128,7 +164,7 @@ func main() {
 	}
 
 	// Создаём Downloader
-	dl, err := downloader.NewDownloader(cfg.Downloader.BaseURL, cfg.Downloader.UserAgent, cfg.Datafiles.Path, pm)
+	dl, err := downloader.NewDownloader(cfg.Downloader.BaseURL, cfg.Downloader.UserAgent, cfg.Datafiles.Path, pm, checkedUrlsDB)
 	if err != nil {
 		log.Fatalf("Failed to create downloader: %v", err)
 	}
@@ -209,7 +245,7 @@ func main() {
 	log.Printf("Using root database path from config: %s", cfg.Database.Path)
 
 	// Проверяем --repeat
-	if *repeatFlag && !*skipIfExistsFlag {
+	if *repeatFlag && !*skipExistsFlag {
 		*repeatFlag = false
 	}
 
@@ -225,41 +261,45 @@ func main() {
 	if *typeFlag != "" {
 		var proxies []string
 		for {
-			// Проверяем прокси
-			log.Println("Ensuring proxies...")
-			if err := pm.EnsureProxies(context.Background()); err != nil {
-				log.Printf("Warning: failed to ensure proxies: %v", err)
-				if len(proxies) == 0 {
-					log.Fatalf("No proxies available to continue")
-				}
-				log.Println("Continuing with last known proxies")
-			} else {
-				proxies, err = pm.GetProxies()
-				if err != nil {
-					log.Printf("Warning: failed to get proxies: %v", err)
+			// Проверяем прокси, если не пропускаем загрузку
+			if !*skipDownloadFlag {
+				log.Println("Ensuring proxies...")
+				if err := pm.EnsureProxies(context.Background()); err != nil {
+					log.Printf("Warning: failed to ensure proxies: %v", err)
 					if len(proxies) == 0 {
 						log.Fatalf("No proxies available to continue")
 					}
 					log.Println("Continuing with last known proxies")
-				} else if len(proxies) == 0 {
-					log.Fatalf("No working proxies found")
 				} else {
-					log.Printf("Found %d working proxies", len(proxies))
+					proxies, err = pm.GetProxies()
+					if err != nil {
+						log.Printf("Warning: failed to get proxies: %v", err)
+						if len(proxies) == 0 {
+							log.Fatalf("No proxies available to continue")
+						}
+						log.Println("Continuing with last known proxies")
+					} else if len(proxies) == 0 {
+						log.Fatalf("No working proxies found")
+					} else {
+						log.Printf("Found %d working proxies", len(proxies))
+					}
 				}
 			}
 
 			// Генерируем URL-ы
 			log.Println("Generating URLs...")
-			urls, err := cmdutils.GenerateURLs(cfg.Downloader.BaseURL, *marketFlag, *pairFlag, *typeFlag, startDate, endDate, *debugFlag, *skipIfExistsFlag, proxies, cfg.Downloader.UserAgent, cfg.Datafiles.Path)
+			urls, err := cmdutils.GenerateURLs(dl, *marketFlag, *pairFlag, *typeFlag, startDate, endDate, *debugFlag, *skipExistsFlag, *skipDownloadFlag, cfg.Datafiles.Path)
 			if err != nil {
 				log.Fatalf("Failed to generate URLs: %v", err)
 			}
 
-			// Запускаем загрузку
-			fmt.Fprintln(os.Stdout)
-			log.Println("Downloading files...")
-			if err := dl.DownloadFiles(context.Background(), urls); err != nil {
-				log.Printf("Warning: some files failed to download: %v", err)
+			if !*skipDownloadFlag {
+				// Запускаем загрузку
+				fmt.Fprintln(os.Stdout)
+				log.Println("Downloading files...")
+				if err := dl.DownloadFiles(context.Background(), urls); err != nil {
+					log.Printf("Warning: some files failed to download: %v", err)
+				}
 			}
 
 			// Группируем ZIP-файлы по типу и рынку
@@ -269,30 +309,68 @@ func main() {
 				files      []string
 			}
 
-			// Нормализуем BaseURL для TrimPrefix
-			baseURLPrefix := strings.TrimSuffix(cfg.Downloader.BaseURL, "/") + "/"
-			log.Printf("Using baseURLPrefix for trimming: %s", baseURLPrefix)
-
 			// Обрабатываем trades
 			if *typeFlag == "trades" {
 				log.Println("Processing Trades...")
 				var zipGroups []ZipGroup
 				spblFiles := make([]string, 0)
 				umcblFiles := make([]string, 0)
-				for _, fileInfo := range urls {
-					relativePath := strings.TrimPrefix(fileInfo.URL, baseURLPrefix)
-					zipPath := filepath.Join(cfg.Datafiles.Path, relativePath)
+
+				// Определяем директории в зависимости от marketFlag
+				marketDirs := []string{}
+				if *marketFlag == "spot" {
+					marketDirs = append(marketDirs, "SPBL")
+				} else if *marketFlag == "futures" {
+					marketDirs = append(marketDirs, "UMCBL")
+				} else if *marketFlag == "all" {
+					marketDirs = append(marketDirs, "SPBL", "UMCBL")
+				}
+
+				// Собираем все ZIP-файлы из директорий
+				for _, marketDir := range marketDirs {
+					dir := filepath.Join(cfg.Datafiles.Path, "trades", marketDir, *pairFlag)
 					if *debugFlag {
-						log.Printf("Processing URL: %s, relativePath: %s, zipPath: %s", fileInfo.URL, relativePath, zipPath)
+						log.Printf("Scanning directory: %s", dir)
 					}
-					if strings.Contains(strings.ToLower(relativePath), "trades/") {
-						if strings.Contains(relativePath, "/SPBL/") {
-							spblFiles = append(spblFiles, zipPath)
-						} else if strings.Contains(relativePath, "/UMCBL/") {
-							umcblFiles = append(umcblFiles, zipPath)
+					err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+						if err != nil {
+							log.Printf("Error accessing path %s: %v", path, err)
+							return nil
 						}
+						if !info.IsDir() && strings.HasSuffix(info.Name(), ".zip") {
+							// Фильтруем по датам
+							dateStr := strings.Split(strings.TrimSuffix(info.Name(), ".zip"), "_")[0]
+							if len(dateStr) != 8 {
+								if *debugFlag {
+									log.Printf("Skipping file %s: invalid date format", path)
+								}
+								return nil
+							}
+							fileDate, err := time.Parse("20060102", dateStr)
+							if err != nil {
+								if *debugFlag {
+									log.Printf("Skipping file %s: cannot parse date %s", path, dateStr)
+								}
+								return nil
+							}
+							if !fileDate.Before(startDate) && !fileDate.After(endDate) {
+								if marketDir == "SPBL" {
+									spblFiles = append(spblFiles, path)
+								} else if marketDir == "UMCBL" {
+									umcblFiles = append(umcblFiles, path)
+								}
+								if *debugFlag {
+									log.Printf("Added local file: %s", path)
+								}
+							}
+						}
+						return nil
+					})
+					if err != nil {
+						log.Printf("Failed to walk directory %s: %v", dir, err)
 					}
 				}
+
 				if (*marketFlag == "spot" || *marketFlag == "all") && len(spblFiles) > 0 {
 					dbPath := filepath.Join(cfg.Database.Path, "trades", "SPBL", *pairFlag+".db")
 					TempDbPath := filepath.Join(cfg.Database.TempPath, "trades", "SPBL", *pairFlag+".db")
@@ -315,6 +393,30 @@ func main() {
 					if err := os.MkdirAll(filepath.Dir(group.TempDbPath), 0755); err != nil {
 						log.Printf("Failed to create directory for %s: %v", group.TempDbPath, err)
 						continue
+					}
+					// Для trades: копируем существующую БД из dbPath в TempDbPath, если она существует
+					if _, err := os.Stat(group.dbPath); err == nil {
+						if *debugFlag {
+							log.Printf("Copying existing database from %s to %s", group.dbPath, group.TempDbPath)
+						}
+						srcFile, err := os.Open(group.dbPath)
+						if err != nil {
+							log.Printf("Failed to open source database %s: %v", group.dbPath, err)
+							continue
+						}
+						defer srcFile.Close()
+						dstFile, err := os.Create(group.TempDbPath)
+						if err != nil {
+							log.Printf("Failed to create temp database %s: %v", group.TempDbPath, err)
+							continue
+						}
+						defer dstFile.Close()
+						if _, err := io.Copy(dstFile, srcFile); err != nil {
+							log.Printf("Failed to copy database from %s to %s: %v", group.dbPath, group.TempDbPath, err)
+							continue
+						}
+					} else if *debugFlag {
+						log.Printf("No existing database found at %s, creating new one at %s", group.dbPath, group.TempDbPath)
 					}
 					dbInstance, err := db.NewDB(group.TempDbPath, *typeFlag)
 					if err != nil {
@@ -342,12 +444,36 @@ func main() {
 
 				for _, marketCode := range marketCodes {
 					dir := filepath.Join(cfg.Datafiles.Path, "depth", *pairFlag, marketCode)
+					if *debugFlag {
+						log.Printf("Scanning directory: %s", dir)
+					}
 					err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 						if err != nil {
-							return err
+							log.Printf("Error accessing path %s: %v", path, err)
+							return nil
 						}
 						if !info.IsDir() && strings.HasSuffix(info.Name(), ".zip") {
-							depthFiles = append(depthFiles, path)
+							// Фильтруем по датам
+							dateStr := strings.Split(strings.TrimSuffix(info.Name(), ".zip"), "_")[0]
+							if len(dateStr) != 8 {
+								if *debugFlag {
+									log.Printf("Skipping file %s: invalid date format", path)
+								}
+								return nil
+							}
+							fileDate, err := time.Parse("20060102", dateStr)
+							if err != nil {
+								if *debugFlag {
+									log.Printf("Skipping file %s: cannot parse date %s", path, dateStr)
+								}
+								return nil
+							}
+							if !fileDate.Before(startDate) && !fileDate.After(endDate) {
+								depthFiles = append(depthFiles, path)
+								if *debugFlag {
+									log.Printf("Added local file: %s", path)
+								}
+							}
 						}
 						return nil
 					})
