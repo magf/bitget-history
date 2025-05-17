@@ -54,8 +54,8 @@ func main() {
 	exportMT5 := flag.Bool("export-mt5", false, "Export data to MT5 CSV format")
 	timeoutFlag := flag.Int("timeout", 3, "Proxy check timeout in seconds")
 	debugFlag := flag.Bool("debug", false, "Enable debug logging")
-	skipIfExistsFlag := flag.Bool("skip-if-exists", false, "Skip downloading if file exists locally (for depth only)")
-	repeatFlag := flag.Bool("repeat", false, "Repeat process until all files are downloaded (for depth with --skip-if-exists only)")
+	skipIfExistsFlag := flag.Bool("skip-if-exists", false, "Skip downloading if file exists locally")
+	repeatFlag := flag.Bool("repeat", false, "Repeat process until all files are downloaded (for --skip-if-exists only)")
 
 	// Короткие флаги
 	flag.BoolVar(helpFlag, "h", false, "Show help message (short)")
@@ -66,8 +66,8 @@ func main() {
 	flag.StringVar(endFlag, "e", "", "End date (short)")
 	flag.IntVar(timeoutFlag, "T", 3, "Proxy check timeout in seconds (short)")
 	flag.BoolVar(debugFlag, "d", false, "Enable debug logging (short)")
-	flag.BoolVar(skipIfExistsFlag, "S", false, "Skip downloading if file exists locally (for depth only) (short)")
-	flag.BoolVar(repeatFlag, "r", false, "Repeat process until all files are downloaded (for depth with --skip-if-exists only) (short)")
+	flag.BoolVar(skipIfExistsFlag, "S", false, "Skip downloading if file exists locally (short)")
+	flag.BoolVar(repeatFlag, "r", false, "Repeat process until all files are downloaded (for --skip-if-exists only) (short)")
 
 	flag.Parse()
 
@@ -185,7 +185,7 @@ func main() {
 	var proxies []string
 
 	// Проверяем --repeat
-	if *repeatFlag && (*typeFlag != "depth" || !*skipIfExistsFlag) {
+	if *repeatFlag && !*skipIfExistsFlag {
 		*repeatFlag = false
 	}
 
