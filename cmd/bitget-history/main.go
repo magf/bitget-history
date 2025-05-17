@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/magf/bitget-history/internal/cmdutils"
+	"github.com/magf/bitget-history/internal/cmdutils/export"
 	"github.com/magf/bitget-history/internal/db"
 	"github.com/magf/bitget-history/internal/downloader"
 	"github.com/magf/bitget-history/internal/proxymanager"
@@ -381,7 +382,7 @@ func main() {
 	if *exportMT5 {
 		for _, marketCode := range marketCodes {
 			dbPath := filepath.Join(cfg.Database.Path, "depth", *pairFlag+".db")
-			outputFile, err := db.ExportToMT5CSV(dbPath, *pairFlag, marketCode, startDate, endDate)
+			outputFile, err := export.ExportToMT5CSV(dbPath, *pairFlag, marketCode, "m1", startDate, endDate)
 			if err != nil {
 				log.Printf("Failed to export to MT5 CSV: %v", err)
 			} else {
