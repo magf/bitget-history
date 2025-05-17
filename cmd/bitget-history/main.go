@@ -36,6 +36,9 @@ type Config struct {
 		TempPath     string `yaml:"temp_path"`
 		BackupSuffix string `yaml:"bak_suffix"`
 	} `yaml:"database"`
+	Datafiles struct {
+		Path string `yaml:"path"`
+	} `yaml:"datafiles"`
 	Downloader struct {
 		BaseURL   string `yaml:"base_url"`
 		UserAgent string `yaml:"user_agent"`
@@ -190,8 +193,7 @@ func main() {
 	}
 
 	// Создаём Downloader
-	outputDir := "/var/lib/bitget-history/offline"
-	dl, err := downloader.NewDownloader(cfg.Downloader.BaseURL, cfg.Downloader.UserAgent, outputDir, pm)
+	dl, err := downloader.NewDownloader(cfg.Downloader.BaseURL, cfg.Downloader.UserAgent, cfg.Datafiles.Path, pm)
 	if err != nil {
 		log.Fatalf("Failed to create downloader: %v", err)
 	}
@@ -232,7 +234,7 @@ func main() {
 
 			// Генерируем URL-ы
 			log.Println("Generating URLs...")
-			urls, err := cmdutils.GenerateURLs(cfg.Downloader.BaseURL, *marketFlag, *pairFlag, *typeFlag, startDate, endDate, *debugFlag, *skipIfExistsFlag, proxies, cfg.Downloader.UserAgent, outputDir)
+			urls, err := cmdutils.GenerateURLs(cfg.Downloader.BaseURL, *marketFlag, *pairFlag, *typeFlag, startDate, endDate, *debugFlag, *skipIfExistsFlag, proxies, cfg.Downloader.UserAgent, cfg.Datafiles.Path)
 			if err != nil {
 				log.Fatalf("Failed to generate URLs: %v", err)
 			}
@@ -263,7 +265,7 @@ func main() {
 				umcblFiles := make([]string, 0)
 				for _, fileInfo := range urls {
 					relativePath := strings.TrimPrefix(fileInfo.URL, baseURLPrefix)
-					zipPath := filepath.Join(outputDir, relativePath)
+					zipPath := filepath.Join(cfg.Datafiles.Path, relativePath)
 					if *debugFlag {
 						log.Printf("Processing URL: %s, relativePath: %s, zipPath: %s", fileInfo.URL, relativePath, zipPath)
 					}
@@ -323,7 +325,7 @@ func main() {
 				var depthFiles []string
 
 				for _, marketCode := range marketCodes {
-					dir := filepath.Join(outputDir, "depth", *pairFlag, marketCode)
+					dir := filepath.Join(cfg.Datafiles.Path, "depth", *pairFlag, marketCode)
 					err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 						if err != nil {
 							return err
