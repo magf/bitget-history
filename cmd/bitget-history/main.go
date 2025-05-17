@@ -76,6 +76,25 @@ func main() {
 
 	flag.Parse()
 
+	// Выводим справку, если указан --help или нет параметров
+	if *helpFlag || len(os.Args) == 1 {
+		cmdutils.PrintHelp()
+		return
+	}
+
+	// Run server
+	if *serverFlag {
+		// Настраиваем единый сервер
+		mux := http.NewServeMux()
+		backend.StartServer(mux)
+		web.StartServer(mux)
+		log.Println("Server running on http://localhost:8080")
+		if err := http.ListenAndServe(":8080", mux); err != nil {
+			log.Fatalf("Server failed: %v", err)
+		}
+		return
+	}
+
 	// Читаем конфиг
 	configFile := filepath.Join("config", "config.yaml")
 	configOverrideFile := filepath.Join("config", "config-override.yaml")
@@ -126,25 +145,6 @@ func main() {
 			redownloadBrokenArchives(brokenArchives, cfg, pm, dl)
 		} else {
 			log.Println("No broken archives found.")
-		}
-		return
-	}
-
-	// Выводим справку, если указан --help или нет параметров
-	if *helpFlag || len(os.Args) == 1 {
-		cmdutils.PrintHelp()
-		return
-	}
-
-	// Run server
-	if *serverFlag {
-		// Настраиваем единый сервер
-		mux := http.NewServeMux()
-		backend.StartServer(mux)
-		web.StartServer(mux)
-		log.Println("Server running on http://localhost:8080")
-		if err := http.ListenAndServe(":8080", mux); err != nil {
-			log.Fatalf("Server failed: %v", err)
 		}
 		return
 	}
