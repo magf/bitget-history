@@ -148,7 +148,7 @@ func (db *DB) Close() error {
 // ProcessZipFiles обрабатывает Zip-файлы и выгружает данные в SQLite.
 func (db *DB) ProcessZipFiles(zipFiles []string, debug bool) error {
 	tmpRawDataDir := "/tmp/bitget-history/raw"
-	// Очищаем /tmp/bitget-history перед началом
+	// Очищаем /tmp/bitget-history/database
 	log.Printf("Cleaning temporary directory: %s", tmpRawDataDir)
 	if err := os.RemoveAll(tmpRawDataDir); err != nil {
 		return fmt.Errorf("failed to clean %s: %w", tmpRawDataDir, err)
@@ -157,7 +157,7 @@ func (db *DB) ProcessZipFiles(zipFiles []string, debug bool) error {
 		return fmt.Errorf("failed to create %s: %w", tmpRawDataDir, err)
 	}
 
-	// Дропаем таблицы перед обработкой
+	// Дропаем таблицы перед обработкой (depth only)
 	if db.dataType == "depth" {
 		log.Printf("Dropping depth tables in %s", db.path)
 		_, err := db.conn.Exec(`DROP TABLE IF EXISTS "1"`)
@@ -208,33 +208,6 @@ func (db *DB) ProcessZipFiles(zipFiles []string, debug bool) error {
 			return fmt.Errorf("failed to recreate index idx_2_timestamp in %s: %w", db.path, err)
 		}
 		log.Printf("Recreated index idx_2_timestamp in %s", db.path)
-	} else if db.dataType == "trades" {
-		log.Printf("Dropping trades table in %s", db.path)
-		_, err := db.conn.Exec("DROP TABLE IF EXISTS trades")
-		if err != nil {
-			return fmt.Errorf("failed to drop trades table in %s: %w", db.path, err)
-		}
-		// Пересоздаём таблицу
-		_, err = db.conn.Exec(`
-			CREATE TABLE trades (
-				trade_id TEXT PRIMARY KEY,
-				timestamp INTEGER,
-				price REAL,
-				side TEXT,
-				volume_quote REAL,
-				size_base REAL
-			)
-		`)
-		if err != nil {
-			return fmt.Errorf("failed to recreate trades table in %s: %w", db.path, err)
-		}
-		log.Printf("Recreated trades table in %s", db.path)
-		// Пересоздаём индекс
-		_, err = db.conn.Exec("CREATE INDEX idx_trades_timestamp ON trades(timestamp)")
-		if err != nil {
-			return fmt.Errorf("failed to recreate index idx_trades_timestamp in %s: %w", db.path, err)
-		}
-		log.Printf("Created index idx_trades_timestamp in %s", db.path)
 	}
 
 	for _, zipPath := range zipFiles {
