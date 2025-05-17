@@ -199,7 +199,7 @@ func (d *Downloader) downloadWithProxy(ctx context.Context, fileURL, proxyURLStr
 	log.Printf("Wrote %d bytes to %s", n, outputPath)
 
 	// Проверяем, что файл является Zip
-	if err := checkZipFile(outputPath); err != nil {
+	if err := CheckZipFile(outputPath); err != nil {
 		log.Printf("Invalid Zip file %s: %v", outputPath, err)
 		os.Remove(outputPath)
 		return err
@@ -208,8 +208,8 @@ func (d *Downloader) downloadWithProxy(ctx context.Context, fileURL, proxyURLStr
 	return nil
 }
 
-// checkZipFile проверяет, является ли файл валидным Zip.
-func checkZipFile(path string) error {
+// CheckZipFile проверяет, является ли файл валидным Zip.
+func CheckZipFile(path string) error {
 	// Проверяем размер файла
 	fileInfo, err := os.Stat(path)
 	if err != nil {

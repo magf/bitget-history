@@ -59,6 +59,7 @@ func main() {
 	debugFlag := flag.Bool("debug", false, "Enable debug logging")
 	skipIfExistsFlag := flag.Bool("skip-if-exists", false, "Skip downloading if file exists locally")
 	repeatFlag := flag.Bool("repeat", false, "Repeat process until all files are downloaded (for --skip-if-exists only)")
+	recheckExists := flag.Bool("recheck-exists", false, "Recheck existing non-zero archives for corruption")
 
 	// Короткие флаги
 	flag.BoolVar(helpFlag, "h", false, "Show help message (short)")
@@ -71,8 +72,63 @@ func main() {
 	flag.BoolVar(debugFlag, "d", false, "Enable debug logging (short)")
 	flag.BoolVar(skipIfExistsFlag, "S", false, "Skip downloading if file exists locally (short)")
 	flag.BoolVar(repeatFlag, "r", false, "Repeat process until all files are downloaded (for --skip-if-exists only) (short)")
+	flag.BoolVar(recheckExists, "R", false, "Recheck existing non-zero archives for corruption (short)")
 
 	flag.Parse()
+
+	// Читаем конфиг
+	configFile := filepath.Join("config", "config.yaml")
+	configOverrideFile := filepath.Join("config", "config-override.yaml")
+	var cfg Config
+
+	// Читаем основной конфиг
+	data, err := os.ReadFile(configFile)
+	if err != nil {
+		log.Fatalf("Failed to read config %s: %v", configFile, err)
+	}
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		log.Fatalf("Failed to parse config %s: %v", configFile, err)
+	}
+
+	// Читаем переопределение, если есть
+	if _, err := os.Stat(configOverrideFile); err == nil {
+		overrideData, err := os.ReadFile(configOverrideFile)
+		if err != nil {
+			log.Fatalf("Failed to read override config %s: %v", configOverrideFile, err)
+		}
+		if err := yaml.Unmarshal(overrideData, &cfg); err != nil {
+			log.Fatalf("Failed to parse override config %s: %v", configOverrideFile, err)
+		}
+	}
+
+	// Создаём ProxyManager
+	timeout := time.Duration(*timeoutFlag) * time.Second
+	pm, err := proxymanager.NewProxyManager(cfg.Proxy.RawFile, cfg.Proxy.WorkingFile, cfg.Proxy.Fallback, cfg.Proxy.Username, cfg.Proxy.Password, timeout)
+	if err != nil {
+		log.Fatalf("Failed to create proxy manager: %v", err)
+	}
+
+	// Создаём Downloader
+	dl, err := downloader.NewDownloader(cfg.Downloader.BaseURL, cfg.Downloader.UserAgent, cfg.Datafiles.Path, pm)
+	if err != nil {
+		log.Fatalf("Failed to create downloader: %v", err)
+	}
+
+	// Проверяем существующие архивы, если указан флаг --recheck-exists
+	if *recheckExists {
+		log.Println("Rechecking existing archives...")
+		brokenArchives, err := recheckExistingArchives(cfg.Datafiles.Path, *debugFlag)
+		if err != nil {
+			log.Fatalf("Failed to recheck archives: %v", err)
+		}
+		if len(brokenArchives) > 0 {
+			log.Printf("Found %d broken archives. Starting redownload...", len(brokenArchives))
+			redownloadBrokenArchives(brokenArchives, cfg, pm, dl)
+		} else {
+			log.Println("No broken archives found.")
+		}
+		return
+	}
 
 	// Выводим справку, если указан --help или нет параметров
 	if *helpFlag || len(os.Args) == 1 {
@@ -141,31 +197,6 @@ func main() {
 		log.SetFlags(log.LstdFlags | log.Lshortfile)
 	}
 
-	// Читаем конфиг
-	configFile := filepath.Join("config", "config.yaml")
-	configOverrideFile := filepath.Join("config", "config-override.yaml")
-	var cfg Config
-
-	// Читаем основной конфиг
-	data, err := os.ReadFile(configFile)
-	if err != nil {
-		log.Fatalf("Failed to read config %s: %v", configFile, err)
-	}
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		log.Fatalf("Failed to parse config %s: %v", configFile, err)
-	}
-
-	// Читаем переопределение, если есть
-	if _, err := os.Stat(configOverrideFile); err == nil {
-		overrideData, err := os.ReadFile(configOverrideFile)
-		if err != nil {
-			log.Fatalf("Failed to read override config %s: %v", configOverrideFile, err)
-		}
-		if err := yaml.Unmarshal(overrideData, &cfg); err != nil {
-			log.Fatalf("Failed to parse override config %s: %v", configOverrideFile, err)
-		}
-	}
-
 	// Проверяем путь к базе
 	if cfg.Database.TempPath == "" || strings.Contains(cfg.Database.TempPath, "%s") {
 		log.Fatalf("Error: invalid temp database path in config: %s", cfg.Database.TempPath)
@@ -177,25 +208,9 @@ func main() {
 	}
 	log.Printf("Using root database path from config: %s", cfg.Database.Path)
 
-	// Создаём ProxyManager
-	timeout := time.Duration(*timeoutFlag) * time.Second
-	pm, err := proxymanager.NewProxyManager(cfg.Proxy.RawFile, cfg.Proxy.WorkingFile, cfg.Proxy.Fallback, cfg.Proxy.Username, cfg.Proxy.Password, timeout)
-	if err != nil {
-		log.Fatalf("Failed to create proxy manager: %v", err)
-	}
-
-	// Инициализируем список прокси
-	var proxies []string
-
 	// Проверяем --repeat
 	if *repeatFlag && !*skipIfExistsFlag {
 		*repeatFlag = false
-	}
-
-	// Создаём Downloader
-	dl, err := downloader.NewDownloader(cfg.Downloader.BaseURL, cfg.Downloader.UserAgent, cfg.Datafiles.Path, pm)
-	if err != nil {
-		log.Fatalf("Failed to create downloader: %v", err)
 	}
 
 	// Собираем все ZIP-файлы из директорий spot (1) и futures (2)
@@ -208,6 +223,7 @@ func main() {
 
 	// Основной цикл
 	if *typeFlag != "" {
+		var proxies []string
 		for {
 			// Проверяем прокси
 			log.Println("Ensuring proxies...")
@@ -394,4 +410,101 @@ func main() {
 	}
 
 	log.Println("Processing completed successfully")
+}
+
+// recheckExistingArchives проверяет все ненулевые ZIP-архивы в директории и возвращает список битых
+func recheckExistingArchives(rootDir string, debug bool) ([]string, error) {
+	var brokenArchives []string
+	log.Println("Rechecking existing archives...")
+	err := filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			log.Printf("Error accessing path %s: %v", path, err)
+			return nil // Пропускаем проблемные пути
+		}
+		if !info.IsDir() && strings.HasSuffix(strings.ToLower(info.Name()), ".zip") {
+			if info.Size() == 0 {
+				if debug {
+					log.Printf("Skipping zero-sized archive: %s", path)
+				}
+				return nil
+			}
+			if debug {
+				log.Printf("Checking archive: %s", path)
+			}
+			// Проверяем, что файл является Zip
+			if err := downloader.CheckZipFile(path); err != nil {
+				if debug {
+					log.Printf("Archive %s is broken", path)
+				} else {
+					fmt.Fprintf(os.Stdout, "\rArchive %s is broken", path)
+				}
+				brokenArchives = append(brokenArchives, path)
+			} else {
+				if debug {
+					log.Printf("Archive %s is valid", path)
+				} else {
+					fmt.Fprintf(os.Stdout, "\rArchive %s is valid", path)
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to walk directory %s: %w", rootDir, err)
+	}
+	log.Println("Recheck done.")
+	return brokenArchives, nil
+}
+
+// redownloadBrokenArchives перезагружает битые архивы через валидные прокси
+func redownloadBrokenArchives(brokenArchives []string, cfg Config, pm *proxymanager.ProxyManager, dl *downloader.Downloader) {
+	// Обновляем прокси
+	log.Println("Ensuring proxies for redownload...")
+	var proxies []string
+	if err := pm.EnsureProxies(context.Background()); err != nil {
+		log.Printf("Warning: failed to ensure proxies: %v", err)
+		proxies, err = pm.GetProxies()
+		if err != nil || len(proxies) == 0 {
+			log.Fatalf("No proxies available to continue")
+		}
+		log.Println("Continuing with last known proxies")
+	} else {
+		var err error
+		proxies, err = pm.GetProxies()
+		if err != nil || len(proxies) == 0 {
+			log.Fatalf("No working proxies found")
+		}
+		log.Printf("Found %d working proxies", len(proxies))
+	}
+
+	// Формируем список файлов для загрузки
+	urls := make([]downloader.FileInfo, 0, len(brokenArchives))
+	for _, archive := range brokenArchives {
+		// Получаем относительный путь
+		relPath, err := filepath.Rel(cfg.Datafiles.Path, archive)
+		if err != nil {
+			log.Printf("Failed to get relative path for %s: %v", archive, err)
+			continue
+		}
+		// Формируем URL
+		url := fmt.Sprintf("%s/%s", strings.TrimSuffix(cfg.Downloader.BaseURL, "/"), relPath)
+		urls = append(urls, downloader.FileInfo{
+			URL:           url,
+			ContentLength: 0, // Не знаем размер заранее
+		})
+	}
+
+	if len(urls) == 0 {
+		log.Println("No valid URLs generated for broken archives")
+		return
+	}
+
+	// Запускаем загрузку
+	fmt.Fprintln(os.Stdout)
+	log.Printf("Redownloading %d broken archives...", len(urls))
+	if err := dl.DownloadFiles(context.Background(), urls); err != nil {
+		log.Printf("Warning: some files failed to redownload: %v", err)
+	} else {
+		log.Println("Redownload completed successfully")
+	}
 }
