@@ -33,12 +33,11 @@ func NewDB(TempDbPath, dataType string) (*DB, error) {
 		return nil, fmt.Errorf("invalid data type: %s (must be trades or depth)", dataType)
 	}
 	log.Printf("Opening database: %s for %s", TempDbPath, dataType)
-	conn, err := sql.Open("sqlite3", TempDbPath)
+	conn, err := sql.Open("sqlite3", TempDbPath+"?_journal_mode=WAL&cache=shared")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database %s: %w", TempDbPath, err)
 	}
 
-	// Включаем WAL для производительности
 	_, err = conn.Exec("PRAGMA journal_mode=WAL;")
 	if err != nil {
 		conn.Close()
@@ -46,7 +45,6 @@ func NewDB(TempDbPath, dataType string) (*DB, error) {
 	}
 
 	if dataType == "trades" {
-		// Создаём таблицу trades
 		_, err = conn.Exec(`
 			CREATE TABLE IF NOT EXISTS trades (
 				trade_id TEXT PRIMARY KEY,
@@ -55,23 +53,15 @@ func NewDB(TempDbPath, dataType string) (*DB, error) {
 				side TEXT,
 				volume_quote REAL,
 				size_base REAL
-			)
+			);
+			CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);
 		`)
 		if err != nil {
 			conn.Close()
-			return nil, fmt.Errorf("failed to create trades table in %s: %w", TempDbPath, err)
+			return nil, fmt.Errorf("failed to create trades schema in %s: %w", TempDbPath, err)
 		}
-		log.Printf("Created trades table in %s", TempDbPath)
-
-		// Создаём индекс
-		_, err = conn.Exec("CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp)")
-		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("failed to create index idx_trades_timestamp in %s: %w", TempDbPath, err)
-		}
-		log.Printf("Created index idx_trades_timestamp in %s", TempDbPath)
-	} else { // depth
-		// Создаём таблицу 1 (spot)
+		log.Printf("Initialized trades schema in %s", TempDbPath)
+	} else {
 		_, err = conn.Exec(`
 			CREATE TABLE IF NOT EXISTS "1" (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,16 +70,7 @@ func NewDB(TempDbPath, dataType string) (*DB, error) {
 				bid_price REAL,
 				ask_volume REAL,
 				bid_volume REAL
-			)
-		`)
-		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("failed to create table 1 in %s: %w", TempDbPath, err)
-		}
-		log.Printf("Created table 1 in %s", TempDbPath)
-
-		// Создаём таблицу 2 (futures)
-		_, err = conn.Exec(`
+			);
 			CREATE TABLE IF NOT EXISTS "2" (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
 				timestamp INTEGER,
@@ -97,28 +78,15 @@ func NewDB(TempDbPath, dataType string) (*DB, error) {
 				bid_price REAL,
 				ask_volume REAL,
 				bid_volume REAL
-			)
+			);
+			CREATE INDEX IF NOT EXISTS idx_1_timestamp ON "1"(timestamp);
+			CREATE INDEX IF NOT EXISTS idx_2_timestamp ON "2"(timestamp);
 		`)
 		if err != nil {
 			conn.Close()
-			return nil, fmt.Errorf("failed to create table 2 in %s: %w", TempDbPath, err)
+			return nil, fmt.Errorf("failed to create depth schema in %s: %w", TempDbPath, err)
 		}
-		log.Printf("Created table 2 in %s", TempDbPath)
-
-		// Создаём индексы
-		_, err = conn.Exec(`CREATE INDEX IF NOT EXISTS idx_1_timestamp ON "1"(timestamp)`)
-		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("failed to create index idx_1_timestamp in %s: %w", TempDbPath, err)
-		}
-		log.Printf("Created index idx_1_timestamp in %s", TempDbPath)
-
-		_, err = conn.Exec(`CREATE INDEX IF NOT EXISTS idx_2_timestamp ON "2"(timestamp)`)
-		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("failed to create index idx_2_timestamp in %s: %w", TempDbPath, err)
-		}
-		log.Printf("Created index idx_2_timestamp in %s", TempDbPath)
+		log.Printf("Initialized depth schema in %s", TempDbPath)
 	}
 
 	return &DB{conn: conn, path: TempDbPath, dataType: dataType}, nil
@@ -148,7 +116,7 @@ func (db *DB) Close() error {
 // ProcessZipFiles обрабатывает Zip-файлы и выгружает данные в SQLite.
 func (db *DB) ProcessZipFiles(zipFiles []string, debug bool) error {
 	tmpRawDataDir := "/tmp/bitget-history/raw"
-	// Очищаем /tmp/bitget-history/database
+	// Очищаем /tmp/bitget-history/raw
 	log.Printf("Cleaning temporary directory: %s", tmpRawDataDir)
 	if err := os.RemoveAll(tmpRawDataDir); err != nil {
 		return fmt.Errorf("failed to clean %s: %w", tmpRawDataDir, err)
@@ -236,7 +204,6 @@ func (db *DB) ProcessZipFiles(zipFiles []string, debug bool) error {
 	}
 
 	fmt.Fprintln(os.Stdout)
-	log.Printf("Temporary files left in %s for debugging", tmpRawDataDir)
 	return nil
 }
 
@@ -291,15 +258,17 @@ func (db *DB) processSingleZip(zipPath, tmpRawDataDir string, debug bool) error 
 		if err := extractFile(csvFile, csvPath); err != nil {
 			return fmt.Errorf("failed to extract CSV from %s: %w", zipPath, err)
 		}
-		log.Printf("Extracted CSV: %s", csvPath)
+		if debug {
+			log.Printf("Extracted CSV: %s", csvPath)
+		}
 	} else if xlsxFile != nil {
 		// Извлекаем XLSX
 		xlsxPath := filepath.Join(tmpRawDataDir, xlsxFile.Name)
 		if err := extractFile(xlsxFile, xlsxPath); err != nil {
 			return fmt.Errorf("failed to extract XLSX from %s: %w", zipPath, err)
 		}
-		// Конвертируем XLSX в CSV
-		if err := convertXLSXtoCSV(xlsxPath, csvPath); err != nil {
+		// Конвертируем XLSX в CSV и удаляем XLSX
+		if err := convertXLSXtoCSV(xlsxPath, csvPath, debug); err != nil {
 			return fmt.Errorf("failed to convert XLSX to CSV for %s: %w", zipPath, err)
 		}
 		if debug {
@@ -312,9 +281,16 @@ func (db *DB) processSingleZip(zipPath, tmpRawDataDir string, debug bool) error 
 	// Обрабатываем CSV
 	if db.dataType == "depth" {
 		tableName := marketCode // "1" или "2"
-		return db.processDepthCSV(zipPath, csvPath, tableName, debug)
+		if err := db.importCSVtoDepth(zipPath, csvPath, tableName, debug); err != nil {
+			return fmt.Errorf("failed to import CSV to depth for %s: %w", zipPath, err)
+		}
+	} else {
+		if err := db.importCSVtoTrades(zipPath, csvPath, debug); err != nil {
+			return fmt.Errorf("failed to import CSV to trades for %s: %w", zipPath, err)
+		}
 	}
-	return db.processTradesCSV(zipPath, csvPath, debug)
+
+	return nil
 }
 
 // extractFile извлекает файл из Zip в указанный путь.
@@ -339,8 +315,8 @@ func extractFile(file *zip.File, destPath string) error {
 	return err
 }
 
-// convertXLSXtoCSV конвертирует XLSX в CSV.
-func convertXLSXtoCSV(xlsxPath, csvPath string) error {
+// convertXLSXtoCSV конвертирует XLSX в CSV и удаляет исходный XLSX-файл.
+func convertXLSXtoCSV(xlsxPath, csvPath string, debug bool) error {
 	// Читаем XLSX в трёхмерный слайс
 	rows, err := xlsx.FileToSlice(xlsxPath)
 	if err != nil {
@@ -419,16 +395,20 @@ func convertXLSXtoCSV(xlsxPath, csvPath string) error {
 		}
 	}
 
+	// Удаляем XLSX-файл после успешной конвертации
+	removeFile(xlsxPath, debug)
+
 	return nil
 }
 
-// processTradesCSV обрабатывает CSV для trades.
-func (db *DB) processTradesCSV(zipPath, csvPath string, debug bool) error {
+// importCSVtoTrades импортирует CSV в таблицу trades и удаляет CSV-файл.
+func (db *DB) importCSVtoTrades(zipPath, csvPath string, debug bool) error {
 	csvFile, err := os.Open(csvPath)
 	if err != nil {
 		return fmt.Errorf("failed to open CSV %s: %w", csvPath, err)
 	}
 	defer csvFile.Close()
+	removeFile(csvPath, debug)
 
 	reader := csv.NewReader(csvFile)
 	reader.FieldsPerRecord = -1 // Разрешить разное количество полей
@@ -519,10 +499,9 @@ func (db *DB) processTradesCSV(zipPath, csvPath string, debug bool) error {
 		affected, _ := result.RowsAffected()
 		if affected == 0 {
 			if debug {
-
 				log.Printf("Skipped record in %s at line %d: duplicate trade_id %s", zipPath, i+1, tradeID)
-			} else {
-				fmt.Fprintf(os.Stdout, "\rSkipped record in %s at line %d: duplicate trade_id %s", zipPath, i+1, tradeID)
+				// } else {
+				// 	fmt.Fprintf(os.Stdout, "\rSkipped record in %s at line %d: duplicate trade_id %s", zipPath, i+1, tradeID)
 			}
 			skipped++
 		} else {
@@ -534,7 +513,9 @@ func (db *DB) processTradesCSV(zipPath, csvPath string, debug bool) error {
 		tx.Rollback()
 		return fmt.Errorf("failed to commit transaction in %s: %w", db.path, err)
 	}
-	log.Printf("\nCommitted transaction for trades CSV %s in %s, inserted %d rows, skipped %d rows", csvPath, db.path, inserted, skipped)
+	if debug {
+		log.Printf("Committed transaction for trades CSV %s in %s, inserted %d rows, skipped %d rows", csvPath, db.path, inserted, skipped)
+	}
 
 	// Выполняем чекпоинт WAL
 	_, err = db.conn.Exec("PRAGMA wal_checkpoint(TRUNCATE);")
@@ -549,13 +530,14 @@ func (db *DB) processTradesCSV(zipPath, csvPath string, debug bool) error {
 	return nil
 }
 
-// processDepthCSV обрабатывает CSV для depth.
-func (db *DB) processDepthCSV(zipPath, csvPath, tableName string, debug bool) error {
+// importCSVtoDepth импортирует CSV в таблицу depth и удаляет CSV-файл.
+func (db *DB) importCSVtoDepth(zipPath, csvPath, tableName string, debug bool) error {
 	csvFile, err := os.Open(csvPath)
 	if err != nil {
 		return fmt.Errorf("failed to open CSV %s: %w", csvPath, err)
 	}
 	defer csvFile.Close()
+	removeFile(csvPath, debug)
 
 	reader := csv.NewReader(csvFile)
 	reader.FieldsPerRecord = -1 // Разрешить разное количество полей
@@ -651,6 +633,7 @@ func (db *DB) processDepthCSV(zipPath, csvPath, tableName string, debug bool) er
 	if debug {
 		log.Printf("Committed transaction for depth CSV %s in %s (table %s), inserted %d rows, skipped %d rows", csvPath, db.path, tableName, inserted, skipped)
 	}
+
 	// Выполняем чекпоинт WAL
 	_, err = db.conn.Exec("PRAGMA wal_checkpoint(TRUNCATE);")
 	if err != nil {
@@ -661,5 +644,14 @@ func (db *DB) processDepthCSV(zipPath, csvPath, tableName string, debug bool) er
 		}
 	}
 
+	return nil
+}
+
+func removeFile(fileName string, debug bool) error {
+	if err := os.Remove(fileName); err != nil {
+		log.Printf("Warning: failed to remove file %s: %v", fileName, err)
+	} else if debug {
+		log.Printf("File %s removed", fileName)
+	}
 	return nil
 }
