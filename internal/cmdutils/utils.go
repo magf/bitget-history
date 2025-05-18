@@ -290,6 +290,8 @@ func PrintHelp() {
 	fmt.Println("  -e, --end string      End date (YYYY-MM-DD) (default: today)")
 	fmt.Println("  -T, --timeout int     Proxy check timeout in seconds (default: 3)")
 	fmt.Println("  -d, --debug           Enable debug logging")
-	fmt.Println("  -S, --skip-if-exists  Skip downloading if file exists locally")
-	fmt.Println("  -r, --repeat          Repeat process until all files are downloaded (only for depth with -S)")
+	fmt.Println("  -X, --skip-exists 	 Skip downloading if file exists locally")
+	fmt.Println("  -S, --skip-download   Skip downloading and reimport existing local files")
+	fmt.Println("  -r, --repeat          Repeat process until all files are downloaded (for -S, --skip-exists only)")
+	fmt.Println("  -R, --recheck-exists  Recheck existing non-zero archives for corruptio")
 }
